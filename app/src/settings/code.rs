@@ -81,4 +81,13 @@ define_settings_group!(CodeSettings, settings: [
         toml_path: "code.review.scan_child_repos",
         description: "When the terminal folder isn't a git repository, scan its direct subfolders for repositories and list them in Code Review.",
     },
+    diff_layout: DiffLayoutSetting {
+        type: crate::code::diff_layout::DiffLayout,
+        default: crate::code::diff_layout::DiffLayout::Inline,
+        supported_platforms: SupportedPlatforms::DESKTOP,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        private: false,
+        toml_path: "code.editor.diff_layout",
+        description: "Layout for Code Review diff views: 'inline' or 'side_by_side'.",
+    },
 ]);

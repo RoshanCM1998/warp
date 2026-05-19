@@ -177,6 +177,22 @@ pub enum PaneStateChange {
     Maximized,
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeReviewDiffLayout {
+    Inline,
+    SideBySide,
+}
+
+impl From<crate::code::diff_layout::DiffLayout> for CodeReviewDiffLayout {
+    fn from(value: crate::code::diff_layout::DiffLayout) -> Self {
+        match value {
+            crate::code::diff_layout::DiffLayout::Inline => Self::Inline,
+            crate::code::diff_layout::DiffLayout::SideBySide => Self::SideBySide,
+        }
+    }
+}
+
 /// Telemetry events associated with the code review pane.
 #[derive(Serialize, Debug, EnumDiscriminants)]
 #[strum_discriminants(derive(EnumIter))]
@@ -211,6 +227,11 @@ pub enum CodeReviewTelemetryEvent {
         is_local: Option<bool>,
         /// The new diff mode.
         mode: DiffMode,
+    },
+    /// Emitted when the user changes the Code Review diff layout setting.
+    DiffLayoutChanged {
+        from: CodeReviewDiffLayout,
+        to: CodeReviewDiffLayout,
     },
     /// Failure when we are calculating the diff metadata.
     LoadMetadataFailed {
@@ -376,6 +397,9 @@ impl TelemetryEvent for CodeReviewTelemetryEvent {
             }
             CodeReviewTelemetryEvent::FileSaved { is_local } => {
                 Some(json!({ "is_local": is_local }))
+            }
+            CodeReviewTelemetryEvent::DiffLayoutChanged { from, to } => {
+                Some(json!({ "from": from, "to": to }))
             }
             CodeReviewTelemetryEvent::PaneStateChanged {
                 is_local,
@@ -546,6 +570,7 @@ impl TelemetryEventDesc for CodeReviewTelemetryEventDiscriminants {
             Self::FileSaved => "CodeReview.FileSaved",
             Self::PaneStateChanged => "CodeReview.PaneStateChanged",
             Self::BaseChanged => "CodeReview.BaseChanged",
+            Self::DiffLayoutChanged => "CodeReview.DiffLayoutChanged",
             Self::LoadMetadataFailed => "CodeReview.LoadMetadataFailed",
             Self::LoadDiffFailed => "CodeReview.LoadDiffFailed",
             Self::DiffLoadCompleted => "CodeReview.DiffLoadCompleted",
@@ -576,6 +601,7 @@ impl TelemetryEventDesc for CodeReviewTelemetryEventDiscriminants {
             Self::FileSaved => "File saved in code review pane",
             Self::PaneStateChanged => "Code review pane minimized or maximized",
             Self::BaseChanged => "Diff base changed in code review",
+            Self::DiffLayoutChanged => "Code review diff layout setting changed",
             Self::LoadMetadataFailed => "Failure when calculating diff metadata",
             Self::LoadDiffFailed => "Failure when loading diff content",
             Self::DiffLoadCompleted => "Diff content loaded successfully",
@@ -614,6 +640,7 @@ impl TelemetryEventDesc for CodeReviewTelemetryEventDiscriminants {
             Self::GitButtonTriggered | Self::GitDialogCompleted => {
                 EnablementState::Flag(FeatureFlag::GitOperationsInCodeReview)
             }
+            Self::DiffLayoutChanged => EnablementState::Flag(FeatureFlag::SideBySideDiffLayout),
             _ => EnablementState::Always,
         }
     }
