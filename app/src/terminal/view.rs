@@ -7479,11 +7479,9 @@ impl TerminalView {
     #[cfg(feature = "local_fs")]
     fn maybe_scan_child_repos_for_review(&mut self, ctx: &mut ViewContext<Self>) {
         if !*CodeSettings::as_ref(ctx).scan_child_repos {
-            log::info!("[scan-child-repos] skip: toggle off");
             return;
         }
         let Some(active_directory) = self.active_session_path_if_local(ctx) else {
-            log::info!("[scan-child-repos] skip: no local active directory");
             return;
         };
         // Only scan when the cwd isn't itself inside a git repo — we don't
@@ -7492,16 +7490,15 @@ impl TerminalView {
             .get_root_for_path(&LocalOrRemotePath::Local(active_directory.clone()))
             .is_some()
         {
-            log::info!("[scan-child-repos] skip: cwd {active_directory:?} is itself in a repo");
             return;
         }
-        log::info!("[scan-child-repos] scanning children of {active_directory:?}");
+        log::debug!("[scan-child-repos] scanning children of {active_directory:?}");
         let parent_dir = active_directory.to_string_lossy().into_owned();
         let fut = DetectedRepositories::handle(ctx).update(ctx, |repos, ctx| {
             repos.detect_child_git_repos(&parent_dir, RepoDetectionSource::TerminalNavigation, ctx)
         });
         ctx.spawn(fut, move |_me, roots, ctx| {
-            log::info!("[scan-child-repos] discovered {} child repos", roots.len());
+            log::debug!("[scan-child-repos] discovered {} child repos", roots.len());
             // Only trigger a refresh if we actually discovered child repos.
             if !roots.is_empty() {
                 ctx.emit(Event::Pane(PaneEvent::RepoChanged));

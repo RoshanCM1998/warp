@@ -422,12 +422,6 @@ impl DiffStateModel {
     // ── Event forwarding ─────────────────────────────────────────────
 
     fn forward_event(&mut self, event: &DiffStateModelEvent, ctx: &mut ModelContext<Self>) {
-        if let DiffStateModelEvent::NewDiffsComputed { diffs, .. } = event {
-            log::info!(
-                "[scan-child-debug] wrapper forward_event: NewDiffsComputed(has_diffs={}) → re-emitting to subscribers",
-                diffs.is_some()
-            );
-        }
         match event {
             DiffStateModelEvent::CurrentBranchChanged => {
                 ctx.emit(DiffStateModelEvent::CurrentBranchChanged);

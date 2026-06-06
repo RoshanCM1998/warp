@@ -585,14 +585,9 @@ impl RightPanelView {
                     .as_ref()
                     .and_then(|s| s.selected_repo_path.clone());
 
-                log::info!(
-                    "[scan-child-debug] RepositoriesChanged: old_selected={old_selected:?}, new_selected={new_selected:?}, repos={:?}",
-                    repositories
-                );
                 // Only close the old view if the selection actually changed.
                 if old_selected != new_selected {
                     if let Some(old_path) = &old_selected {
-                        log::info!("[scan-child-debug] RepositoriesChanged: selection changed → closing old view {old_path:?}");
                         self.close_code_review_view(*pane_group_id, old_path, ctx);
                     }
                 }
@@ -784,12 +779,19 @@ impl RightPanelView {
         if state.available_repos.len() <= 1 {
             return None;
         }
+        // Only impose a wide minimum when nothing is selected, so the dropdown
+        // stays clickable in the empty "pick a repo" state (child-repo scan).
+        // Once a repo is selected, let it size to the name so a short name like
+        // "smartmoving-crew" doesn't leave dead space before the toggle.
+        let min_width = if state.selected_repo_path.is_some() {
+            0.
+        } else {
+            160.
+        };
         Some(
             Container::new(
                 ConstrainedBox::new(ChildView::new(&state.dropdown).finish())
-                    // Give the dropdown a stable width so it doesn't collapse to
-                    // nothing when no repo is selected yet (child-repo scan).
-                    .with_min_width(160.)
+                    .with_min_width(min_width)
                     .with_max_width(300.)
                     .finish(),
             )
@@ -1828,10 +1830,6 @@ impl RightPanelView {
             .as_ref(ctx)
             .get_code_review_view(pane_group_id, repo_path);
 
-        log::info!(
-            "[scan-child-debug] ensure_code_review_view_exists: repo={repo_path:?}, is_panel_open={is_panel_open}, existing_view={}",
-            existing_view.is_some()
-        );
         if let Some(view) = existing_view {
             if is_panel_open {
                 // on_open is idempotent (guards on is_open), so this is safe for
@@ -1852,7 +1850,6 @@ impl RightPanelView {
             });
 
             let Some(diff_state_model) = diff_state_model else {
-                log::info!("[scan-child-debug] ensure_code_review_view_exists: get_or_create_diff_state_model returned None → bail");
                 return;
             };
             let is_known_repo = self
@@ -1882,10 +1879,6 @@ impl RightPanelView {
                 pane_group.read(ctx, |pane_group, ctx| pane_group.active_session_view(ctx))
             };
 
-            log::info!(
-                "[scan-child-debug] ensure_code_review_view_exists: is_known_repo={is_known_repo}, terminal_view={}",
-                terminal_view.is_some()
-            );
             if let Some(terminal_view) = terminal_view {
                 if let Some(view) = self.create_code_review_view(
                     repo_path,
@@ -1894,17 +1887,12 @@ impl RightPanelView {
                     terminal_view.downgrade(),
                     ctx,
                 ) {
-                    log::info!("[scan-child-debug] ensure_code_review_view_exists: view CREATED, is_panel_open={is_panel_open} → on_open {}", if is_panel_open { "called" } else { "deferred" });
                     if is_panel_open {
                         view.update(ctx, |view, ctx| {
                             view.on_open(ctx);
                         });
                     }
-                } else {
-                    log::info!("[scan-child-debug] ensure_code_review_view_exists: create_code_review_view returned None");
                 }
-            } else {
-                log::info!("[scan-child-debug] ensure_code_review_view_exists: NO terminal_view → view NOT created (panel will hang on skeleton)");
             }
         }
     }

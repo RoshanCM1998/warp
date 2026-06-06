@@ -318,6 +318,24 @@ pub fn update_index_set(
     }
 }
 
+/// Whether a code review view for `path` should be kept alive for a pane group.
+///
+/// A view is "active" if a terminal is cd'd into its repo (`terminal_mapping`)
+/// OR the repo is one of the pane group's known roots (`known_repos`). The
+/// latter clause is what keeps child repos surfaced by the "scan child repos"
+/// toggle alive: they have no terminal of their own, so without it their view
+/// would be evicted right after creation (→ panel stuck on "Loading…"). This is
+/// a free function so the retain logic is unit-testable without constructing a
+/// full `CodeReviewView`.
+#[cfg(feature = "local_fs")]
+fn code_review_view_is_active(
+    path: &LocalOrRemotePath,
+    terminal_mapping: &HashMap<LocalOrRemotePath, EntityId>,
+    known_repos: Option<&IndexSet<LocalOrRemotePath>>,
+) -> bool {
+    terminal_mapping.contains_key(path) || known_repos.is_some_and(|repos| repos.contains(path))
+}
+
 #[cfg(feature = "local_fs")]
 impl WorkingDirectoriesModel {
     pub fn new() -> Self {
@@ -490,10 +508,8 @@ impl WorkingDirectoriesModel {
             return;
         };
 
-        code_review_views.retain(|path, _| {
-            terminal_mapping.contains_key(path)
-                || known_repos.is_some_and(|repos| repos.contains(path))
-        });
+        code_review_views
+            .retain(|path, _| code_review_view_is_active(path, terminal_mapping, known_repos));
     }
 
     /// Get an existing CodeReviewView for a specific repository in a pane group.
@@ -787,11 +803,6 @@ impl WorkingDirectoriesModel {
                 }
                 let children = DetectedRepositories::as_ref(ctx)
                     .child_repos_for_path(&LocalOrRemotePath::Local(dir.clone()));
-                log::info!(
-                    "[scan-child-repos] feed: {} child repos under {:?}",
-                    children.len(),
-                    dir
-                );
                 for child in children {
                     if let Some(local) = child.to_local_path() {
                         new_local_repo_roots.push(local.to_path_buf());
@@ -799,7 +810,9 @@ impl WorkingDirectoriesModel {
                     }
                 }
             }
-            log::info!("[scan-child-repos] feed: added {added} child repos to pane-group set");
+            if added > 0 {
+                log::debug!("[scan-child-repos] surfaced {added} child repos in pane-group set");
+            }
         }
 
         let mut new_roots: HashSet<PathBuf> =

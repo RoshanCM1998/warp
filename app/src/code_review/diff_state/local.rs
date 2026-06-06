@@ -287,7 +287,6 @@ impl LocalDiffStateModel {
         };
 
         if let Some(repo_path) = &repo_path {
-            log::info!("[scan-child-debug] LocalDiffStateModel::new kicking off detect for {repo_path:?}");
             let fut = DetectedRepositories::handle(ctx).update(ctx, |model, ctx| {
                 model.detect_possible_local_git_repo(
                     repo_path,
@@ -297,16 +296,13 @@ impl LocalDiffStateModel {
             });
 
             ctx.spawn(fut, move |me, repo_path, ctx| {
-                log::info!("[scan-child-debug] detect resolved: repo_path={repo_path:?}");
                 if let Some(repo_path) = &repo_path {
                     if let Some(repo_handle) = DetectedRepositories::as_ref(ctx)
                         .get_local_watched_repo_for_path(repo_path, ctx)
                     {
-                        log::info!("[scan-child-debug] watched repo FOUND for {repo_path:?} → set_active_repository");
                         me.set_active_repository(repo_handle, ctx);
                         return;
                     }
-                    log::info!("[scan-child-debug] detect returned a path but NO watched repo for {repo_path:?} → NotInRepository");
                 }
                 // Repo detection completed but found no repository.
                 // Emit so subscribers (e.g. the server model) can drain
@@ -547,14 +543,12 @@ impl LocalDiffStateModel {
         }
 
         let Some(current_repository) = &self.repository else {
-            log::info!("[scan-child-debug] load_diffs_for_current_repo: repository is None → early return (will load after set_active_repository)");
             return;
         };
         let current_repository_path = current_repository
             .as_ref(ctx)
             .root_dir()
             .to_local_path_lossy();
-        log::info!("[scan-child-debug] load_diffs_for_current_repo: loading diffs for {current_repository_path:?}");
         let mode = self.mode.clone();
         self.state = InternalDiffState::Loading;
         self.computing_diffs_abort_handle = Some(ctx.spawn(
@@ -951,10 +945,6 @@ impl LocalDiffStateModel {
         // `registration_future` may resolve immediately (e.g. watcher already active), and
         // `handle_repository_updated` relies on `self.repository` being available for cleanup.
         self.repository = Some(new_repository.clone());
-        log::info!(
-            "[scan-child-debug] set_active_repository: metadata_refresh_enabled={} (if false, state stays Detecting until on_open)",
-            self.metadata_refresh_enabled
-        );
 
         // Only kick off the expensive metadata + diff loading when the code
         // review pane is actually open.  When the pane opens later, `on_open`
@@ -1423,11 +1413,9 @@ impl LocalDiffStateModel {
 
         match metadata {
             Ok(metadata) => {
-                log::info!("[scan-child-debug] handle_updated_metadata_for_repo: OK (should_reload_diffs={should_reload_diffs})");
                 self.metadata = Some(metadata);
             }
             Err(e) => {
-                log::info!("[scan-child-debug] handle_updated_metadata_for_repo: ERR {e}");
                 let err = DiffStateError::from(e);
                 warp_core::report_error!(&err);
                 send_telemetry_from_ctx!(
@@ -1491,10 +1479,6 @@ impl LocalDiffStateModel {
             }
         };
 
-        log::info!(
-            "[scan-child-debug] handle_updated_state_for_repo: state→Loaded (changes_ok={})",
-            diffs.changes.is_ok()
-        );
         self.state = InternalDiffState::Loaded((&diffs).into());
         // Compute merge base and flush deferred invalidations before emitting.
         self.recompute_merge_base_and_flush(ctx);

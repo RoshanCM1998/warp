@@ -1,14 +1,15 @@
 #![cfg(feature = "local_fs")]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
+use indexmap::IndexSet;
 use repo_metadata::repositories::DetectedRepositories;
 use repo_metadata::watcher::DirectoryWatcher;
 use warpui::{App, EntityId};
 
-use super::PaneGroupRepositoryRoots;
+use super::{code_review_view_is_active, PaneGroupRepositoryRoots};
 use crate::code::buffer_location::LocalOrRemotePath;
 use crate::pane_group::WorkingDirectoriesModel;
 
@@ -208,6 +209,51 @@ fn refresh_working_directories_surfaces_child_repos_when_scan_enabled() {
             "scan OFF: behavior unchanged — no child repos surfaced"
         );
     });
+}
+
+// Regression guard for the "scan child repos" stuck-loading bug: a CodeReviewView
+// for a scanned child repo (which has NO terminal cd'd into it) must be retained
+// as long as the repo is one of the pane group's known roots. Without the
+// known-roots clause the view was evicted right after creation, dropping its
+// only strong ref and freezing the panel on "Loading open changes…".
+#[test]
+fn code_review_view_retained_for_scanned_child_without_terminal() {
+    let child = local_str("/ws/child"); // scanned child: in known roots, no terminal
+    let with_terminal = local_str("/ws/with_terminal");
+    let orphan = local_str("/ws/orphan");
+
+    // A terminal is cd'd only into `with_terminal`.
+    let mut terminal_mapping: HashMap<LocalOrRemotePath, EntityId> = HashMap::new();
+    terminal_mapping.insert(with_terminal.clone(), EntityId::new());
+
+    // The pane group's known roots include the scanned child (terminal-less).
+    let mut known: IndexSet<LocalOrRemotePath> = IndexSet::new();
+    known.insert(child.clone());
+    known.insert(with_terminal.clone());
+
+    // Scanned child: no terminal, but a known root → retained.
+    assert!(
+        code_review_view_is_active(&child, &terminal_mapping, Some(&known)),
+        "scanned child repo (no terminal) must be retained because it's a known root"
+    );
+    // Terminal-mapped repo → retained.
+    assert!(code_review_view_is_active(
+        &with_terminal,
+        &terminal_mapping,
+        Some(&known)
+    ));
+    // Neither a terminal nor a known root → evicted.
+    assert!(!code_review_view_is_active(
+        &orphan,
+        &terminal_mapping,
+        Some(&known)
+    ));
+    // Regression guard: drop the known-roots clause and the terminal-less child
+    // is evicted — exactly the bug that froze the panel.
+    assert!(
+        !code_review_view_is_active(&child, &terminal_mapping, None),
+        "without known-roots membership a terminal-less child would be evicted"
+    );
 }
 
 // Regression test for GH-10598: the code review panel's manually selected

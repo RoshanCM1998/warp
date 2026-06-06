@@ -65,6 +65,7 @@ use crate::ai::agent::{
     AIAgentAttachment, AgentReviewCommentBatch, CurrentHead, DiffBase, DiffSetHunk,
 };
 use crate::ai::blocklist::agent_view::AgentViewEntryOrigin;
+use crate::ai::loading::shimmering_warp_loading_text;
 use crate::appearance::Appearance;
 use crate::code::buffer_location::LocalOrRemotePath;
 use crate::code::editor::comment_editor::DEFAULT_COMMENT_MAX_WIDTH;
@@ -97,10 +98,8 @@ use crate::code_review::diff_state::{
     DiffHunk, DiffLineType, DiffMode, DiffState, DiffStateModel, DiffStateModelEvent, DiffStats,
     FileDiff, FileDiffAndContent, FileStatusInfo, GitDiffWithBaseContent, GitFileStatus,
 };
-use crate::ai::loading::shimmering_warp_loading_text;
 use crate::code_review::editor_state::CodeReviewEditorState;
 use crate::code_review::find_model::CodeReviewFindModel;
-use warpui::elements::shimmering_text::ShimmeringTextStateHandle;
 #[cfg(feature = "local_fs")]
 use crate::code_review::git_status_update::{
     GitRepoStatusEvent, GitRepoStatusModel, GitStatusUpdateModel,
@@ -156,6 +155,7 @@ use crate::workspace::view::right_panel::{ReviewDestination, ReviewSubmissionRes
 use crate::workspace::{ToastStack, Workspace, WorkspaceAction};
 #[cfg(feature = "local_fs")]
 use crate::TelemetryEvent;
+use warpui::elements::shimmering_text::ShimmeringTextStateHandle;
 
 pub struct CodeReviewHeaderFields {
     pub is_in_split_pane: bool,
@@ -698,11 +698,6 @@ impl CodeReviewView {
     /// Called when the code review view is opened/attached to a pane group.
     /// Subscribes to the diff state model and enables metadata refresh.
     pub fn on_open(&mut self, ctx: &mut ViewContext<Self>) {
-        log::info!(
-            "[scan-child-debug] CodeReviewView::on_open called (was_open={}, repo_path={:?})",
-            self.is_open,
-            self.repo_path()
-        );
         if self.is_open {
             return;
         }
@@ -765,10 +760,6 @@ impl CodeReviewView {
     /// Called when the code review view is closed/detached.
     /// Unsubscribes from the diff state model.
     pub fn on_close(&mut self, ctx: &mut ViewContext<Self>) {
-        log::info!(
-            "[scan-child-debug] CodeReviewView::on_close called (repo_path={:?}) → UNSUBSCRIBING from model",
-            self.repo_path()
-        );
         self.is_open = false;
 
         if self
@@ -2311,20 +2302,6 @@ impl CodeReviewView {
         event: &DiffStateModelEvent,
         ctx: &mut ViewContext<Self>,
     ) {
-        log::info!(
-            "[scan-child-debug] handle_diff_state_model_event: {} (active_repo={}, repo_path={:?})",
-            match event {
-                DiffStateModelEvent::NewDiffsComputed { diffs, .. } =>
-                    if diffs.is_some() { "NewDiffsComputed(Some)" } else { "NewDiffsComputed(None)" },
-                DiffStateModelEvent::SingleFileUpdated { .. } => "SingleFileUpdated",
-                DiffStateModelEvent::MetadataRefreshed(_) => "MetadataRefreshed",
-                DiffStateModelEvent::CurrentBranchChanged => "CurrentBranchChanged",
-                DiffStateModelEvent::BranchesReceived(_) => "BranchesReceived",
-                DiffStateModelEvent::ConnectionLost => "ConnectionLost",
-            },
-            self.active_repo.is_some(),
-            self.repo_path()
-        );
         match event {
             DiffStateModelEvent::CurrentBranchChanged => {
                 self.fetch_branches_and_setup_dropdown(ctx);
@@ -2487,11 +2464,6 @@ impl CodeReviewView {
             return;
         };
 
-        log::info!(
-            "[scan-child-debug] invalidate_all ENTER: diff_state={:?}, has_diff_data={}",
-            self.diff_state(ctx),
-            diff_data.is_some()
-        );
         match self.diff_state(ctx) {
             DiffState::Loading => {
                 if let Some(repo) = self.active_repo.as_mut() {
@@ -2582,27 +2554,6 @@ impl CodeReviewView {
             },
             ctx
         );
-
-        {
-            let (files, with_editor) = self
-                .active_repo
-                .as_ref()
-                .and_then(|r| match &r.state {
-                    CodeReviewViewState::Loaded(ls) => Some((
-                        ls.file_states.len(),
-                        ls.file_states
-                            .values()
-                            .filter(|fs| fs.editor_state.is_some())
-                            .count(),
-                    )),
-                    _ => None,
-                })
-                .unwrap_or((0, 0));
-            log::info!(
-                "[scan-child-debug] invalidate_all built Loaded: {files} files, {with_editor} with editor_state, all_editors_loaded={}",
-                self.all_editors_loaded()
-            );
-        }
 
         if self.all_editors_loaded() {
             let diff_mode = self.diff_state_model.as_ref(ctx).diff_mode(ctx);
@@ -3238,10 +3189,6 @@ impl CodeReviewView {
             | LocalCodeEditorEvent::FailedToLoad { .. } => {
                 // Mark the editor as loaded so we can render it.
                 // This is only relevant for global buffer mode.
-                log::info!(
-                    "[scan-child-debug] editor load event fired for {file_location:?} (matched_index={:?})",
-                    self.file_state_index_for_location(file_location)
-                );
                 self.mark_editor_loaded_for_file(file_location, ctx);
                 ctx.notify();
             }
