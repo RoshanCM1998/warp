@@ -61,6 +61,7 @@ fn refresh_working_directories_collapses_subroots_to_nearest_repo_root() {
                     ],
                     vec![],
                     Some(terminal_1),
+                    false,
                     ctx,
                 );
 
@@ -110,6 +111,7 @@ fn refresh_working_directories_preserves_non_repo_paths_and_dedupes() {
                     ],
                     vec![],
                     Some(terminal_1),
+                    false,
                     ctx,
                 );
 
@@ -124,6 +126,86 @@ fn refresh_working_directories_preserves_non_repo_paths_and_dedupes() {
             roots,
             HashSet::from_iter([local(&canonical_1), local(&canonical_2)]),
             "should preserve non-repo roots and dedupe exact paths"
+        );
+    });
+}
+
+#[test]
+fn refresh_working_directories_surfaces_child_repos_when_scan_enabled() {
+    App::test((), |mut app| async move {
+        let detected_repos_handle = app.add_singleton_model(|_| DetectedRepositories::default());
+
+        // workspace/ is NOT a git repo, but holds two child repos.
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let parent = temp_dir.path().join("workspace");
+        let child_a = parent.join("child_a");
+        let child_b = parent.join("child_b");
+        for repo in [&child_a, &child_b] {
+            fs::create_dir_all(repo.join(".git")).expect("create child .git");
+            fs::write(repo.join(".git").join("HEAD"), "ref: refs/heads/main").expect("HEAD");
+        }
+
+        let canonical_child_a = dunce::canonicalize(&child_a).expect("canonical child_a");
+        let canonical_child_b = dunce::canonicalize(&child_b).expect("canonical child_b");
+
+        // Simulate the child repos having already been discovered + registered
+        // (what `detect_child_git_repos` does at runtime).
+        detected_repos_handle.update(&mut app, |repos, _ctx| {
+            for p in [&canonical_child_a, &canonical_child_b] {
+                let std = warp_util::standardized_path::StandardizedPath::from_local_canonicalized(
+                    p.as_path(),
+                )
+                .expect("canonicalized child path");
+                repos.insert_test_repo_root(std);
+            }
+        });
+
+        let pane_group_id = EntityId::new();
+        let terminal = EntityId::new();
+        let working_directories_handle = app.add_model(|_| WorkingDirectoriesModel::new());
+
+        // Scan ON → the direct child repos of the non-repo parent are listed.
+        let repos_on: HashSet<LocalOrRemotePath> =
+            working_directories_handle.update(&mut app, |model, ctx| {
+                model.refresh_working_directories_for_pane_group(
+                    pane_group_id,
+                    vec![(terminal, LocalOrRemotePath::Local(parent.clone()))],
+                    vec![],
+                    Some(terminal),
+                    true,
+                    ctx,
+                );
+                model
+                    .most_recent_repositories_for_pane_group(pane_group_id)
+                    .expect("pane group exists")
+                    .collect()
+            });
+        assert_eq!(
+            repos_on,
+            HashSet::from_iter([local(&canonical_child_a), local(&canonical_child_b)]),
+            "scan ON: direct child repos of the non-repo parent should be listed"
+        );
+
+        // Scan OFF → unchanged behavior: parent isn't a repo and children are
+        // not scanned, so no repos are surfaced.
+        let repos_off: HashSet<LocalOrRemotePath> =
+            working_directories_handle.update(&mut app, |model, ctx| {
+                model.refresh_working_directories_for_pane_group(
+                    pane_group_id,
+                    vec![(terminal, LocalOrRemotePath::Local(parent.clone()))],
+                    vec![],
+                    Some(terminal),
+                    false,
+                    ctx,
+                );
+                model
+                    .most_recent_repositories_for_pane_group(pane_group_id)
+                    .expect("pane group exists")
+                    .collect()
+            });
+        assert!(
+            repos_off.is_empty(),
+            "scan OFF: behavior unchanged — no child repos surfaced"
         );
     });
 }
@@ -411,6 +493,7 @@ fn shared_diff_state_model_survives_when_other_pane_group_still_references_repo(
                 vec![(terminal_a, LocalOrRemotePath::Local(repo_path.clone()))],
                 vec![],
                 Some(terminal_a),
+                false,
                 ctx,
             );
             model.refresh_working_directories_for_pane_group(
@@ -418,6 +501,7 @@ fn shared_diff_state_model_survives_when_other_pane_group_still_references_repo(
                 vec![(terminal_b, LocalOrRemotePath::Local(repo_path.clone()))],
                 vec![],
                 Some(terminal_b),
+                false,
                 ctx,
             );
         });
@@ -437,6 +521,7 @@ fn shared_diff_state_model_survives_when_other_pane_group_still_references_repo(
                 vec![],
                 vec![],
                 None,
+                false,
                 ctx,
             );
         });
@@ -476,6 +561,7 @@ fn diff_state_model_is_dropped_when_no_pane_group_references_repo() {
                 vec![(terminal, LocalOrRemotePath::Local(repo_path.clone()))],
                 vec![],
                 Some(terminal),
+                false,
                 ctx,
             );
         });
@@ -489,7 +575,14 @@ fn diff_state_model_is_dropped_when_no_pane_group_references_repo() {
 
         // Only pane group leaves the repo → model is orphaned and dropped.
         working_directories_handle.update(&mut app, |model, ctx| {
-            model.refresh_working_directories_for_pane_group(pane_group, vec![], vec![], None, ctx);
+            model.refresh_working_directories_for_pane_group(
+                pane_group,
+                vec![],
+                vec![],
+                None,
+                false,
+                ctx,
+            );
         });
 
         let after_id = working_directories_handle.update(&mut app, |model, ctx| {
@@ -527,6 +620,7 @@ fn remove_pane_group_does_not_drop_diff_state_model_shared_with_other_pane_group
                 vec![(terminal_a, LocalOrRemotePath::Local(repo_path.clone()))],
                 vec![],
                 Some(terminal_a),
+                false,
                 ctx,
             );
             model.refresh_working_directories_for_pane_group(
@@ -534,6 +628,7 @@ fn remove_pane_group_does_not_drop_diff_state_model_shared_with_other_pane_group
                 vec![(terminal_b, LocalOrRemotePath::Local(repo_path.clone()))],
                 vec![],
                 Some(terminal_b),
+                false,
                 ctx,
             );
         });

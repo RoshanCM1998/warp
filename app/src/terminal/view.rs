@@ -7452,6 +7452,63 @@ impl TerminalView {
         }
     }
 
+    /// Public entry point for the Code Review "scan child repos" toggle. Called
+    /// when the toggle flips so child repos appear (or drop out) immediately for
+    /// the active terminal without requiring a re-`cd`.
+    #[cfg(feature = "local_fs")]
+    pub(crate) fn rescan_child_repos_for_review(&mut self, ctx: &mut ViewContext<Self>) {
+        if *CodeSettings::as_ref(ctx).scan_child_repos {
+            // Turning on: clear the scan cache so we re-scan this parent even if
+            // it was scanned during a previous on/off cycle, then discover now.
+            DetectedRepositories::handle(ctx).update(ctx, |repos, _| {
+                repos.clear_child_repo_scan_cache();
+            });
+            self.maybe_scan_child_repos_for_review(ctx);
+        } else {
+            // Turning off: force a repo-set refresh so any previously-listed
+            // child repos drop out of the dropdown.
+            ctx.emit(Event::Pane(PaneEvent::RepoChanged));
+        }
+    }
+
+    /// When the "scan child repos" toggle is enabled and the active terminal's
+    /// working directory is not itself a git repo, scan its direct subfolders
+    /// for child git repos and register them. Once registered, emit
+    /// `RepoChanged` so the workspace refreshes the pane group's repo set and
+    /// the Code Review repo dropdown lists the discovered child repos.
+    #[cfg(feature = "local_fs")]
+    fn maybe_scan_child_repos_for_review(&mut self, ctx: &mut ViewContext<Self>) {
+        if !*CodeSettings::as_ref(ctx).scan_child_repos {
+            log::info!("[scan-child-repos] skip: toggle off");
+            return;
+        }
+        let Some(active_directory) = self.active_session_path_if_local(ctx) else {
+            log::info!("[scan-child-repos] skip: no local active directory");
+            return;
+        };
+        // Only scan when the cwd isn't itself inside a git repo — we don't
+        // surface repos nested inside an existing repo (no submodule noise).
+        if DetectedRepositories::as_ref(ctx)
+            .get_root_for_path(&LocalOrRemotePath::Local(active_directory.clone()))
+            .is_some()
+        {
+            log::info!("[scan-child-repos] skip: cwd {active_directory:?} is itself in a repo");
+            return;
+        }
+        log::info!("[scan-child-repos] scanning children of {active_directory:?}");
+        let parent_dir = active_directory.to_string_lossy().into_owned();
+        let fut = DetectedRepositories::handle(ctx).update(ctx, |repos, ctx| {
+            repos.detect_child_git_repos(&parent_dir, RepoDetectionSource::TerminalNavigation, ctx)
+        });
+        ctx.spawn(fut, move |_me, roots, ctx| {
+            log::info!("[scan-child-repos] discovered {} child repos", roots.len());
+            // Only trigger a refresh if we actually discovered child repos.
+            if !roots.is_empty() {
+                ctx.emit(Event::Pane(PaneEvent::RepoChanged));
+            }
+        });
+    }
+
     pub fn input(&self) -> &ViewHandle<Input> {
         &self.input
     }
@@ -11475,7 +11532,14 @@ impl TerminalView {
                                 }
                                 None => {
                                     #[cfg(feature = "local_fs")]
-                                    me.clear_git_repo_status(ctx);
+                                    {
+                                        me.clear_git_repo_status(ctx);
+                                        // The cwd isn't itself a git repo. If the
+                                        // "scan child repos" toggle is on, discover
+                                        // the cwd's direct child repos so Code Review
+                                        // can list them in the repo dropdown.
+                                        me.maybe_scan_child_repos_for_review(ctx);
+                                    }
                                     ctx.notify();
                                 }
                             }

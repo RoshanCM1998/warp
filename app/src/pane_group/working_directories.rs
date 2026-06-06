@@ -470,15 +470,30 @@ impl WorkingDirectoriesModel {
 
     /// Remove any code review view state that is not active in any of the terminal views that belong to this pane group.
     fn remove_inactive_code_reviews(&mut self, pane_group_id: EntityId) {
-        let Some(code_review_views) = self.code_review_views.get_mut(&pane_group_id) else {
-            return;
-        };
-
         let Some(terminal_mapping) = self.directory_to_terminal.get(&pane_group_id) else {
             return;
         };
 
-        code_review_views.retain(|path, _| terminal_mapping.contains_key(path));
+        // A repo is "active" if a terminal is cd'd into it OR it's one of the
+        // pane group's known repository roots. Child repos surfaced by the
+        // "scan child repos" toggle have NO terminal of their own, so they are
+        // absent from `directory_to_terminal`. Retaining only terminal-mapped
+        // paths would evict a scanned-child's CodeReviewView immediately after
+        // it's stored — dropping the cache's only strong ref, letting the view
+        // get garbage-collected, and killing its DiffStateModel subscription
+        // before the diff finishes loading (→ panel stuck on "Loading open
+        // changes…"). `repository_roots` is the set backing the repo dropdown,
+        // so it includes scanned children and shrinks when the scan is disabled
+        // or the cwd changes — the correct lifetime for these views.
+        let known_repos = self.repository_roots.get(pane_group_id);
+        let Some(code_review_views) = self.code_review_views.get_mut(&pane_group_id) else {
+            return;
+        };
+
+        code_review_views.retain(|path, _| {
+            terminal_mapping.contains_key(path)
+                || known_repos.is_some_and(|repos| repos.contains(path))
+        });
     }
 
     /// Get an existing CodeReviewView for a specific repository in a pane group.
@@ -602,6 +617,11 @@ impl WorkingDirectoriesModel {
         terminal_cwds: Vec<(EntityId, LocalOrRemotePath)>,
         editor_paths: Vec<(EntityId, LocalOrRemotePath)>,
         focused_terminal_id: Option<EntityId>,
+        // When true ("scan child repos" toggle), working directories that are
+        // not themselves inside a git repo also contribute their direct child
+        // repos to the pane group's repo set. Passed in (rather than read from
+        // settings here) so this model stays settings-agnostic and testable.
+        scan_child_repos: bool,
         ctx: &mut ModelContext<Self>,
     ) {
         if terminal_cwds.is_empty() && editor_paths.is_empty() {
@@ -734,7 +754,7 @@ impl WorkingDirectoriesModel {
 
         // Build repo roots and their terminal associations
         // First pass: collect all local repo roots and build initial mapping
-        let new_local_repo_roots: Vec<PathBuf> = self
+        let mut new_local_repo_roots: Vec<PathBuf> = self
             .pane_groups
             .get(&pane_group_id)
             .into_iter()
@@ -742,6 +762,46 @@ impl WorkingDirectoriesModel {
             .filter_map(|lor| lor.to_local_path())
             .filter_map(|dir| self.get_repo_root_for_path(dir, ctx))
             .collect();
+
+        // When "scan child repos" is enabled, also surface the direct child git
+        // repos of any working directory that is NOT itself inside a repo. A
+        // parent directory sits *above* its child repos, so the upward
+        // `get_repo_root_for_path` resolution above can never find them — query
+        // the dedicated downward accessor instead. (The repos themselves are
+        // discovered/registered asynchronously by `detect_child_git_repos`;
+        // here we just read whatever has been registered for these dirs.)
+        if scan_child_repos {
+            let candidate_dirs: Vec<PathBuf> = self
+                .pane_groups
+                .get(&pane_group_id)
+                .into_iter()
+                .flat_map(|dirs| dirs.iter())
+                .filter_map(|lor| lor.to_local_path())
+                .map(|p| p.to_path_buf())
+                .collect();
+            let mut added = 0usize;
+            for dir in candidate_dirs {
+                // Only scan dirs that aren't themselves inside a git repo.
+                if self.get_repo_root_for_path(&dir, ctx).is_some() {
+                    continue;
+                }
+                let children = DetectedRepositories::as_ref(ctx)
+                    .child_repos_for_path(&LocalOrRemotePath::Local(dir.clone()));
+                log::info!(
+                    "[scan-child-repos] feed: {} child repos under {:?}",
+                    children.len(),
+                    dir
+                );
+                for child in children {
+                    if let Some(local) = child.to_local_path() {
+                        new_local_repo_roots.push(local.to_path_buf());
+                        added += 1;
+                    }
+                }
+            }
+            log::info!("[scan-child-repos] feed: added {added} child repos to pane-group set");
+        }
+
         let mut new_roots: HashSet<PathBuf> =
             HashSet::from_iter(new_local_repo_roots.iter().cloned());
         new_roots.extend(new_local_root_paths.iter().cloned());
@@ -846,16 +906,34 @@ impl WorkingDirectoriesModel {
             self.emit_directories_changed(pane_group_id, ctx);
         }
 
+        // Store the focused repo BEFORE emitting RepositoriesChanged so the
+        // code-review panel can read it (via `focused_repo_for_pane_group`) to
+        // decide the default selection — the repo the active terminal is inside.
+        // The event below still only fires when the focused repo changed.
+        let focused_repo_changed = old_focused_repo != focused_repo;
+        self.focused_repo
+            .insert(pane_group_id, focused_repo.clone());
+
         if old_repos != new_deduplicated_repos {
             self.drop_unused_diff_state_models(orphaned_repos, ctx);
             self.emit_repositories_changed(pane_group_id, ctx);
         }
 
-        if old_focused_repo != focused_repo {
-            self.focused_repo
-                .insert(pane_group_id, focused_repo.clone());
+        if focused_repo_changed {
             self.emit_focused_repo_changed(pane_group_id, focused_repo, ctx);
         }
+    }
+
+    /// Returns the repository the pane group's active terminal is inside (the
+    /// "focused" repo), if any. The code-review panel uses this to pick a
+    /// default repo to review — when the terminal sits in a parent folder
+    /// (child-repo scan), this is `None`, so the panel shows the repo list
+    /// without auto-loading any repo's diff.
+    pub fn focused_repo_for_pane_group(
+        &self,
+        pane_group_id: EntityId,
+    ) -> Option<LocalOrRemotePath> {
+        self.focused_repo.get(&pane_group_id).cloned().flatten()
     }
 
     /// Maps a repository to a specific terminal view ID so that
@@ -1003,6 +1081,13 @@ impl WorkingDirectoriesModel {
         Option::<std::iter::Empty<LocalOrRemotePath>>::None
     }
 
+    pub fn focused_repo_for_pane_group(
+        &self,
+        _pane_group_id: EntityId,
+    ) -> Option<LocalOrRemotePath> {
+        None
+    }
+
     /// Get the terminal view ID associated with a specific repository in a pane group.
     pub fn get_terminal_id_for_root_path(
         &self,
@@ -1018,6 +1103,7 @@ impl WorkingDirectoriesModel {
         _terminal_cwds: Vec<(EntityId, LocalOrRemotePath)>,
         _editor_paths: Vec<(EntityId, LocalOrRemotePath)>,
         _focused_terminal_id: Option<EntityId>,
+        _scan_child_repos: bool,
         _ctx: &mut ModelContext<Self>,
     ) {
     }

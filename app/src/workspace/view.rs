@@ -14159,12 +14159,17 @@ impl Workspace {
             .active_session_view(ctx)
             .map(|terminal_view| terminal_view.id());
 
+        // When the "scan child repos" toggle is on, working directories that
+        // aren't themselves repos also surface their direct child repos.
+        let scan_child_repos = *CodeSettings::as_ref(ctx).scan_child_repos;
+
         self.working_directories_model.update(ctx, |model, ctx| {
             model.refresh_working_directories_for_pane_group(
                 pane_group_id,
                 terminal_cwds,
                 local_paths,
                 focused_terminal_id,
+                scan_child_repos,
                 ctx,
             );
         });

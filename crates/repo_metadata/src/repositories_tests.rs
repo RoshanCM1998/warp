@@ -168,6 +168,148 @@ fn test_detect_possible_local_git_repo_nested_repo_created_after_parent_registra
 
 #[test]
 #[cfg(feature = "local_fs")]
+fn test_find_child_git_repos_finds_only_direct_children() {
+    VirtualFS::test("find_child_repos", |dirs, mut vfs| {
+        // workspace/ holds two child repos, a plain (non-repo) dir, and a
+        // grandchild repo nested inside child_a (which must be ignored).
+        stub_git_repository(&mut vfs, "workspace/child_a");
+        stub_git_repository(&mut vfs, "workspace/child_b");
+        stub_git_repository(&mut vfs, "workspace/child_a/nested");
+        vfs.mkdir("workspace/not_a_repo/src")
+            .with_files(vec![Stub::FileWithContent(
+                "workspace/not_a_repo/readme.txt",
+                "hi",
+            )]);
+
+        let workspace = dirs.tests().join("workspace");
+        let child_a = dirs.tests().join("workspace/child_a");
+        let child_b = dirs.tests().join("workspace/child_b");
+
+        App::test((), |mut _app| async move {
+            let mut roots = super::find_child_git_repos(workspace.as_path())
+                .await
+                .into_iter()
+                .filter_map(|info| info.working_tree_path)
+                .map(|p| std::fs::canonicalize(p).unwrap())
+                .collect::<Vec<_>>();
+            roots.sort();
+
+            let mut expected = vec![
+                std::fs::canonicalize(&child_a).unwrap(),
+                std::fs::canonicalize(&child_b).unwrap(),
+            ];
+            expected.sort();
+
+            assert_eq!(
+                roots, expected,
+                "should find direct child repos only — not grandchildren, not plain dirs"
+            );
+        });
+    });
+}
+
+#[test]
+#[cfg(feature = "local_fs")]
+fn test_find_child_git_repos_empty_for_no_children_or_missing_dir() {
+    VirtualFS::test("find_child_repos_empty", |dirs, mut vfs| {
+        vfs.mkdir("empty_workspace/plain/src");
+        let workspace = dirs.tests().join("empty_workspace");
+        let missing = dirs.tests().join("does_not_exist");
+
+        App::test((), |mut _app| async move {
+            // Directory with no child repos → empty.
+            assert!(super::find_child_git_repos(workspace.as_path())
+                .await
+                .is_empty());
+            // Non-existent / unreadable directory → empty, no panic.
+            assert!(super::find_child_git_repos(missing.as_path())
+                .await
+                .is_empty());
+        });
+    });
+}
+
+#[test]
+#[cfg(feature = "local_fs")]
+fn test_child_repos_for_path_returns_direct_children_only() {
+    VirtualFS::test("child_repos_for_path", |dirs, mut vfs| {
+        stub_git_repository(&mut vfs, "ws/child_a");
+        stub_git_repository(&mut vfs, "ws/child_b");
+        stub_git_repository(&mut vfs, "ws/child_a/nested");
+
+        let workspace = dirs.tests().join("ws");
+        let child_a = dirs.tests().join("ws/child_a");
+        let child_b = dirs.tests().join("ws/child_b");
+        let nested = dirs.tests().join("ws/child_a/nested");
+
+        let local_key = |p: &std::path::Path| {
+            LocalOrRemotePath::Local(
+                StandardizedPath::from_local_canonicalized(p)
+                    .unwrap()
+                    .to_local_path()
+                    .unwrap(),
+            )
+        };
+
+        App::test((), |mut app| async move {
+            let _watcher = app.add_singleton_model(DirectoryWatcher::new);
+            let repo_handle = app.add_model(|_| DetectedRepositories::default());
+
+            // Scan + register the direct children of the workspace.
+            repo_handle
+                .update(&mut app, |repo, ctx| {
+                    std::mem::drop(repo.detect_child_git_repos(
+                        &workspace.to_string_lossy(),
+                        RepoDetectionSource::TerminalNavigation,
+                        ctx,
+                    ));
+                    let future_id = *repo.spawned_futures().last().unwrap();
+                    ctx.await_spawned_future(future_id)
+                })
+                .await;
+
+            // Register the grandchild repo via normal (upward) detection so we
+            // can prove child_repos_for_path excludes non-direct children.
+            repo_handle
+                .update(&mut app, |repo, ctx| {
+                    std::mem::drop(repo.detect_possible_local_git_repo(
+                        &nested.to_string_lossy(),
+                        RepoDetectionSource::TerminalNavigation,
+                        ctx,
+                    ));
+                    let future_id = *repo.spawned_futures().last().unwrap();
+                    ctx.await_spawned_future(future_id)
+                })
+                .await;
+
+            let workspace_key = local_key(&workspace);
+            let child_a_key = local_key(&child_a);
+            let child_b_key = local_key(&child_b);
+            let nested_key = local_key(&nested);
+
+            repo_handle.read(&app, |repo, _| {
+                let mut children = repo.child_repos_for_path(&workspace_key);
+                children.sort_by_key(|p| format!("{p:?}"));
+                let mut expected = vec![child_a_key.clone(), child_b_key.clone()];
+                expected.sort_by_key(|p| format!("{p:?}"));
+                assert_eq!(children, expected, "direct children of workspace only");
+                assert!(
+                    !children.contains(&nested_key),
+                    "grandchild must not be a direct child of workspace"
+                );
+
+                // The nested repo IS a direct child of child_a.
+                assert_eq!(
+                    repo.child_repos_for_path(&child_a_key),
+                    vec![nested_key.clone()]
+                );
+            });
+        });
+    });
+}
+
+#[test]
+#[cfg(feature = "local_fs")]
 fn test_find_git_repo_with_worktree() {
     VirtualFS::test("find_git_repo_worktree", |dirs, mut vfs| {
         // Set up a primary repository with a worktree directory.

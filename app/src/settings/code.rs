@@ -59,4 +59,16 @@ define_settings_group!(CodeSettings, settings: [
         toml_path: "code.editor.show_global_search",
         description: "Whether global file search is shown in the tools panel.",
     },
+    // When the terminal's working directory is not itself a git repository,
+    // scan its direct subfolders (one level) for git repos and list them in
+    // the Code Review repo dropdown. Off by default.
+    scan_child_repos: ScanChildRepos {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::DESKTOP,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        private: false,
+        toml_path: "code.review.scan_child_repos",
+        description: "When the terminal folder isn't a git repository, scan its direct subfolders for repositories and list them in Code Review.",
+    },
 ]);

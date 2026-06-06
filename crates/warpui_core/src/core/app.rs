@@ -3671,6 +3671,9 @@ impl AppContext {
                                 false
                             }
                         } else {
+                            log::info!(
+                                "[scan-child-debug] emit_event: FromView subscriber NOT FOUND (window={current_window_id:?}, view={view_id:?}) → DROPPING subscription for emitter {entity_id:?}"
+                            );
                             false
                         }
                     }

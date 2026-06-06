@@ -17,6 +17,7 @@ use warpui::fonts::{Properties, Weight};
 use warpui::keymap::EditableBinding;
 use warpui::platform::Cursor;
 use warpui::ui_components::components::UiComponent;
+use warpui::ui_components::switch::SwitchStateHandle;
 use warpui::{
     AppContext, Entity, EntityId, ModelHandle, SingletonEntity, TypedActionView, View, ViewContext,
     ViewHandle, WeakViewHandle,
@@ -194,6 +195,7 @@ impl CodeReviewState {
     fn set_available_repos(
         &mut self,
         _repos: Vec<LocalOrRemotePath>,
+        _preferred_selection: Option<LocalOrRemotePath>,
         _ctx: &mut ViewContext<RightPanelView>,
     ) {
     }
@@ -202,6 +204,7 @@ impl CodeReviewState {
     fn set_available_repos(
         &mut self,
         repos: Vec<LocalOrRemotePath>,
+        preferred_selection: Option<LocalOrRemotePath>,
         ctx: &mut ViewContext<RightPanelView>,
     ) {
         let should_clear = self
@@ -216,10 +219,24 @@ impl CodeReviewState {
 
         self.update_repo_dropdown(ctx);
 
-        // Auto-select first repo if we have one and no selection yet
+        // Default selection: the repo the terminal is currently inside
+        // (`preferred_selection`), or the sole repo when there's only one.
+        // When neither applies — e.g. the terminal sits in a parent folder and
+        // multiple child repos were discovered — leave nothing selected so the
+        // user picks from the dropdown (we don't auto-load a repo's diff, which
+        // could be an expensive one).
         if self.selected_repo_path.is_none() {
-            if let Some(first_repo) = self.available_repos.first() {
-                self.set_selected_repo(first_repo.clone(), ctx);
+            let to_select = preferred_selection
+                .filter(|repo| self.available_repos.contains(repo))
+                .or_else(|| {
+                    if self.available_repos.len() == 1 {
+                        self.available_repos.first().cloned()
+                    } else {
+                        None
+                    }
+                });
+            if let Some(repo) = to_select {
+                self.set_selected_repo(repo, ctx);
             }
         }
     }
@@ -340,6 +357,9 @@ pub enum RightPanelAction {
     },
     OpenRepository,
     ToggleMaximize,
+    /// Toggles the global "scan child repos" setting and re-scans the active
+    /// terminal so child repos appear in (or disappear from) the repo dropdown.
+    ToggleScanChildRepos,
 }
 
 #[derive(Clone, Debug)]
@@ -366,6 +386,8 @@ pub struct RightPanelView {
     resizable_state_handle: ResizableStateHandle,
     close_button_mouse_state: MouseStateHandle,
     file_navigation_button_mouse_state: MouseStateHandle,
+    #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
+    scan_child_repos_switch_state: SwitchStateHandle,
     #[cfg(feature = "local_fs")]
     open_repository_button: ViewHandle<ActionButton>,
     pub active_pane_group: Option<ViewHandle<PaneGroup>>,
@@ -462,6 +484,7 @@ impl RightPanelView {
             resizable_state_handle,
             close_button_mouse_state: Default::default(),
             file_navigation_button_mouse_state: Default::default(),
+            scan_child_repos_switch_state: SwitchStateHandle::default(),
             #[cfg(feature = "local_fs")]
             open_repository_button,
             active_pane_group: None,
@@ -542,8 +565,16 @@ impl RightPanelView {
                     .as_ref()
                     .and_then(|s| s.selected_repo_path.clone());
 
+                // The repo the active terminal is inside, used as the default
+                // selection. `None` when the terminal is at a parent folder
+                // (child-repo scan) → the panel shows the list, no auto-load.
+                let preferred = self
+                    .working_directories_model
+                    .as_ref(ctx)
+                    .focused_repo_for_pane_group(*pane_group_id);
+
                 if let Some(state) = self.code_review_state.as_mut() {
-                    state.set_available_repos(repositories.clone(), ctx);
+                    state.set_available_repos(repositories.clone(), preferred, ctx);
                 }
 
                 let new_selected = self
@@ -551,9 +582,14 @@ impl RightPanelView {
                     .as_ref()
                     .and_then(|s| s.selected_repo_path.clone());
 
+                log::info!(
+                    "[scan-child-debug] RepositoriesChanged: old_selected={old_selected:?}, new_selected={new_selected:?}, repos={:?}",
+                    repositories
+                );
                 // Only close the old view if the selection actually changed.
                 if old_selected != new_selected {
                     if let Some(old_path) = &old_selected {
+                        log::info!("[scan-child-debug] RepositoriesChanged: selection changed → closing old view {old_path:?}");
                         self.close_code_review_view(*pane_group_id, old_path, ctx);
                     }
                 }
@@ -610,23 +646,24 @@ impl RightPanelView {
         self.active_pane_group = Some(pane_group);
 
         if let Some(state) = &mut self.code_review_state {
-            let (active_repositories, saved_selection) =
+            let (active_repositories, saved_selection, preferred) =
                 working_directories_model.read(ctx, |model, _| {
                     let repos: Vec<LocalOrRemotePath> = model
                         .most_recent_repositories_for_pane_group(pane_group_id)
                         .map(|repos| repos.collect())
                         .unwrap_or_default();
                     let saved = model.get_selected_review_repo(pane_group_id).cloned();
-                    (repos, saved)
+                    let focused = model.focused_repo_for_pane_group(pane_group_id);
+                    (repos, saved, focused)
                 });
 
             // Replace the carried-over selection from a different pane group
             // with whatever was saved for this pane group (if anything). This
-            // ensures `set_available_repos` either keeps the saved selection
-            // (when it's still in the repo list) or falls back to auto-selecting
-            // the first repo, instead of preserving the previous tab's repo.
+            // ensures `set_available_repos` keeps the saved selection (when it's
+            // still in the repo list), or defaults to the focused repo / sole
+            // repo, instead of preserving the previous tab's repo.
             state.selected_repo_path = saved_selection;
-            state.set_available_repos(active_repositories, ctx);
+            state.set_available_repos(active_repositories, preferred, ctx);
         }
 
         let selected = self
@@ -747,6 +784,9 @@ impl RightPanelView {
         Some(
             Container::new(
                 ConstrainedBox::new(ChildView::new(&state.dropdown).finish())
+                    // Give the dropdown a stable width so it doesn't collapse to
+                    // nothing when no repo is selected yet (child-repo scan).
+                    .with_min_width(160.)
                     .with_max_width(300.)
                     .finish(),
             )
@@ -791,13 +831,61 @@ impl RightPanelView {
         .finish()
     }
 
-    fn render_simple_header(&self, close_button: Box<dyn Element>) -> Box<dyn Element> {
+    /// Renders the "scan child repos" toggle button shown in the Code Review
+    /// pane title bar (beside maximize/close). Reflects the current global
+    /// `code.review.scan_child_repos` setting via the button's active state.
+    /// Returns `None` on builds without `local_fs` (the toggle is meaningless
+    /// when local git detection is unavailable).
+    fn render_scan_child_repos_button(
+        &self,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Option<Box<dyn Element>> {
+        #[cfg(feature = "local_fs")]
+        {
+            let is_on = *crate::settings::CodeSettings::as_ref(app).scan_child_repos;
+            // A real on/off switch (matches Warp's settings toggles) for
+            // "scan subfolders for git repositories". `check(is_on)` drives the
+            // visual from the persisted setting; the click dispatches the toggle.
+            Some(
+                Container::new(
+                    appearance
+                        .ui_builder()
+                        .switch(self.scan_child_repos_switch_state.clone())
+                        .check(is_on)
+                        .build()
+                        .on_click(move |ctx, _, _| {
+                            ctx.dispatch_typed_action(RightPanelAction::ToggleScanChildRepos);
+                        })
+                        .finish(),
+                )
+                .with_margin_right(8.)
+                .finish(),
+            )
+        }
+        #[cfg(not(feature = "local_fs"))]
+        {
+            let _ = (appearance, app);
+            None
+        }
+    }
+
+    fn render_simple_header(
+        &self,
+        scan_button: Option<Box<dyn Element>>,
+        close_button: Box<dyn Element>,
+    ) -> Box<dyn Element> {
         let left_spacer = Box::new(Shrinkable::new(1.0, Empty::new().finish()));
+        let mut controls: Vec<Box<dyn Element>> = Vec::new();
+        if let Some(scan_button) = scan_button {
+            controls.push(scan_button);
+        }
+        controls.push(close_button);
         Container::new(
             ConstrainedBox::new(
                 Flex::row()
                     .with_child(left_spacer)
-                    .with_children(vec![close_button])
+                    .with_children(controls)
                     .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
                     .with_cross_axis_alignment(CrossAxisAlignment::Center)
                     .finish(),
@@ -813,9 +901,12 @@ impl RightPanelView {
     fn render_panel_content(&self, app: &AppContext) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
         let close_button = self.close_button(appearance, app);
+        // Built alongside close so the toggle is reachable even in the no-repo
+        // empty state (the motivating case: a parent folder that isn't a repo).
+        let scan_button = self.render_scan_child_repos_button(appearance, app);
 
         let Some(state) = &self.code_review_state else {
-            let simple_header = self.render_simple_header(close_button);
+            let simple_header = self.render_simple_header(scan_button, close_button);
             return Flex::column()
                 .with_child(simple_header)
                 .with_child(
@@ -833,7 +924,63 @@ impl RightPanelView {
         });
 
         let Some(selected_repo_path) = selected_repo_path else {
-            let simple_header = self.render_simple_header(close_button);
+            // Repos were discovered (e.g. a child-repo scan) but none is
+            // selected yet — show the dropdown so the user can pick one, with a
+            // prompt instead of auto-loading any repo's diff. (When there's a
+            // single repo, `set_available_repos` already auto-selects it, so we
+            // only reach here with multiple repos.)
+            if !state.available_repos.is_empty() {
+                let theme = appearance.theme();
+                let mut right_section: Vec<Box<dyn Element>> = Vec::new();
+                if let Some(repo_dropdown) = self.render_repo_dropdown() {
+                    right_section.push(repo_dropdown);
+                }
+                if let Some(scan_button) = scan_button {
+                    right_section.push(scan_button);
+                }
+                right_section.push(self.render_maximize_pane_button());
+                right_section.push(close_button);
+
+                let header = Container::new(
+                    ConstrainedBox::new(
+                        Flex::row()
+                            .with_main_axis_alignment(MainAxisAlignment::End)
+                            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                            .with_child(Box::new(Shrinkable::new(1.0, Empty::new().finish())))
+                            .with_children(right_section)
+                            .finish(),
+                    )
+                    .with_height(PANE_HEADER_HEIGHT)
+                    .finish(),
+                )
+                .with_padding_left(CONTENT_LEFT_MARGIN)
+                .with_padding_right(CONTENT_RIGHT_MARGIN)
+                .finish();
+
+                let prompt_body = Container::new(
+                    Flex::column()
+                        .with_main_axis_alignment(MainAxisAlignment::Center)
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_child(
+                            Text::new_inline(
+                                "Select a repository to review its changes.".to_string(),
+                                appearance.ui_font_family(),
+                                appearance.ui_font_size(),
+                            )
+                            .with_color(theme.sub_text_color(theme.background()).into())
+                            .finish(),
+                        )
+                        .finish(),
+                )
+                .finish();
+
+                return Flex::column()
+                    .with_child(header)
+                    .with_child(Shrinkable::new(1.0, prompt_body).finish())
+                    .finish();
+            }
+
+            let simple_header = self.render_simple_header(scan_button, close_button);
 
             #[cfg(feature = "local_fs")]
             let no_repo_body = {
@@ -885,7 +1032,7 @@ impl RightPanelView {
                 .with_child(code_review_content)
                 .finish()
         } else {
-            let simple_header = self.render_simple_header(close_button);
+            let simple_header = self.render_simple_header(scan_button, close_button);
             Flex::column()
                 .with_child(simple_header)
                 .with_child(
@@ -967,6 +1114,9 @@ impl RightPanelView {
         let mut right_section = Vec::new();
         if let Some(repo_dropdown) = self.render_repo_dropdown() {
             right_section.push(repo_dropdown);
+        }
+        if let Some(scan_button) = self.render_scan_child_repos_button(appearance, app) {
+            right_section.push(scan_button);
         }
         right_section.push(self.render_maximize_pane_button());
         right_section.push(close_button);
@@ -1056,6 +1206,9 @@ impl RightPanelView {
         let mut right_section = Vec::new();
         if let Some(repo_dropdown) = self.render_repo_dropdown() {
             right_section.push(repo_dropdown);
+        }
+        if let Some(scan_button) = self.render_scan_child_repos_button(appearance, app) {
+            right_section.push(scan_button);
         }
         right_section.push(self.render_maximize_pane_button());
         right_section.push(close_button);
@@ -1667,6 +1820,10 @@ impl RightPanelView {
             .as_ref(ctx)
             .get_code_review_view(pane_group_id, repo_path);
 
+        log::info!(
+            "[scan-child-debug] ensure_code_review_view_exists: repo={repo_path:?}, is_panel_open={is_panel_open}, existing_view={}",
+            existing_view.is_some()
+        );
         if let Some(view) = existing_view {
             if is_panel_open {
                 // on_open is idempotent (guards on is_open), so this is safe for
@@ -1687,6 +1844,7 @@ impl RightPanelView {
             });
 
             let Some(diff_state_model) = diff_state_model else {
+                log::info!("[scan-child-debug] ensure_code_review_view_exists: get_or_create_diff_state_model returned None → bail");
                 return;
             };
             let is_known_repo = self
@@ -1696,20 +1854,30 @@ impl RightPanelView {
                 .is_some_and(|mut repos| repos.any(|r| &r == repo_path));
 
             let terminal_view = if is_known_repo {
-                let Some(terminal_view_id) = self
-                    .working_directories_model
+                // Prefer the terminal sitting in this repo. Child repos surfaced
+                // by the "scan child repos" toggle have NO terminal of their own
+                // (no terminal cd'd into them), so fall back to the active
+                // session — otherwise the review view is never created and the
+                // panel hangs on the loading skeleton.
+                self.working_directories_model
                     .as_ref(ctx)
                     .get_terminal_id_for_root_path(pane_group_id, repo_path)
-                else {
-                    return;
-                };
-                ctx.view_with_id::<TerminalView>(ctx.window_id(), terminal_view_id)
+                    .and_then(|terminal_view_id| {
+                        ctx.view_with_id::<TerminalView>(ctx.window_id(), terminal_view_id)
+                    })
+                    .or_else(|| {
+                        pane_group.read(ctx, |pane_group, ctx| pane_group.active_session_view(ctx))
+                    })
             } else {
                 // For repos not yet tracked (e.g. remote repos from direct open),
                 // fall back to the active session.
                 pane_group.read(ctx, |pane_group, ctx| pane_group.active_session_view(ctx))
             };
 
+            log::info!(
+                "[scan-child-debug] ensure_code_review_view_exists: is_known_repo={is_known_repo}, terminal_view={}",
+                terminal_view.is_some()
+            );
             if let Some(terminal_view) = terminal_view {
                 if let Some(view) = self.create_code_review_view(
                     repo_path,
@@ -1718,12 +1886,17 @@ impl RightPanelView {
                     terminal_view.downgrade(),
                     ctx,
                 ) {
+                    log::info!("[scan-child-debug] ensure_code_review_view_exists: view CREATED, is_panel_open={is_panel_open} → on_open {}", if is_panel_open { "called" } else { "deferred" });
                     if is_panel_open {
                         view.update(ctx, |view, ctx| {
                             view.on_open(ctx);
                         });
                     }
+                } else {
+                    log::info!("[scan-child-debug] ensure_code_review_view_exists: create_code_review_view returned None");
                 }
+            } else {
+                log::info!("[scan-child-debug] ensure_code_review_view_exists: NO terminal_view → view NOT created (panel will hang on skeleton)");
             }
         }
     }
@@ -1817,6 +1990,32 @@ impl TypedActionView for RightPanelView {
                         });
                     }
                 }
+            }
+            RightPanelAction::ToggleScanChildRepos => {
+                use warp_core::settings::ToggleableSetting as _;
+
+                // Flip and persist the global setting.
+                crate::settings::CodeSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    let _ = settings.scan_child_repos.toggle_and_save_value(ctx);
+                });
+
+                // Re-scan the active terminal so child repos appear (when turning
+                // on) or drop (when turning off) immediately, without a re-cd.
+                if let Some(active_pane_group) = &self.active_pane_group {
+                    let terminal_view = active_pane_group.read(ctx, |pane_group, ctx| {
+                        pane_group
+                            .active_session_id(ctx)
+                            .and_then(|id| pane_group.terminal_view_from_pane_id(id, ctx))
+                    });
+
+                    if let Some(terminal_view) = terminal_view {
+                        terminal_view.update(ctx, |terminal, ctx| {
+                            terminal.rescan_child_repos_for_review(ctx);
+                        });
+                    }
+                }
+
+                ctx.notify();
             }
         }
     }
