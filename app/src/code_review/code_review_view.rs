@@ -97,8 +97,10 @@ use crate::code_review::diff_state::{
     DiffHunk, DiffLineType, DiffMode, DiffState, DiffStateModel, DiffStateModelEvent, DiffStats,
     FileDiff, FileDiffAndContent, FileStatusInfo, GitDiffWithBaseContent, GitFileStatus,
 };
+use crate::ai::loading::shimmering_warp_loading_text;
 use crate::code_review::editor_state::CodeReviewEditorState;
 use crate::code_review::find_model::CodeReviewFindModel;
+use warpui::elements::shimmering_text::ShimmeringTextStateHandle;
 #[cfg(feature = "local_fs")]
 use crate::code_review::git_status_update::{
     GitRepoStatusEvent, GitRepoStatusModel, GitStatusUpdateModel,
@@ -651,6 +653,10 @@ pub struct CodeReviewView {
     /// Per-repo git status model for the current repository, if any.
     #[cfg(feature = "local_fs")]
     git_repo_status: Option<ModelHandle<GitRepoStatusModel>>,
+    /// Animation state for the shimmering "Loading changes…" text shown while
+    /// the diff is being computed. Persisted on the view so the shimmer keeps
+    /// its animation phase across repaints (the element self-drives at ~30fps).
+    loading_shimmer: ShimmeringTextStateHandle,
 }
 
 impl CodeReviewView {
@@ -1352,6 +1358,7 @@ impl CodeReviewView {
             git_dialog: None,
             #[cfg(feature = "local_fs")]
             git_repo_status: None,
+            loading_shimmer: ShimmeringTextStateHandle::new(),
         };
         view.set_active_repo_comment_model(comment_batch_model, ctx);
         if has_repo {
@@ -3756,6 +3763,41 @@ impl CodeReviewView {
                         .with_padding_bottom(12.)
                         .finish(),
                 )
+                .with_children(placeholder)
+                .finish(),
+        )
+        .with_uniform_padding(16.)
+        .with_padding_top(CONTENT_TOP_MARGIN)
+        .finish()
+    }
+
+    /// Like [`Self::render_loading_state`] but with an animated, shimmering
+    /// "Loading changes…" header instead of the static placeholder header, so
+    /// it's visually clear the panel is working — important for cold child
+    /// repos whose first diff can take several seconds to compute.
+    fn render_loading_state_animated(
+        &self,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let shimmer = shimmering_warp_loading_text(
+            "Loading changes…",
+            appearance.ui_font_size(),
+            self.loading_shimmer.clone(),
+            app,
+        );
+        let placeholder = (0..4).map(|_| {
+            Shrinkable::new(
+                1.,
+                Container::new(CodeReviewView::render_code_diff_placeholder(appearance))
+                    .with_margin_bottom(EDITOR_GAP)
+                    .finish(),
+            )
+            .finish()
+        });
+        Container::new(
+            Flex::column()
+                .with_child(Container::new(shimmer).with_padding_bottom(12.).finish())
                 .with_children(placeholder)
                 .finish(),
         )
@@ -7038,12 +7080,12 @@ impl View for CodeReviewView {
             .unwrap_or(false);
 
         let main_content = match self.state() {
-            CodeReviewViewState::None => CodeReviewView::render_loading_state(appearance),
+            CodeReviewViewState::None => self.render_loading_state_animated(appearance, ctx),
             CodeReviewViewState::Loaded(loaded_state) => {
                 // For global buffer mode, show loading state until all editors have loaded
                 // their buffer content. This prevents a brief flash of empty editors.
                 if !self.all_editors_loaded() {
-                    CodeReviewView::render_loading_state(appearance)
+                    self.render_loading_state_animated(appearance, ctx)
                 } else {
                     self.render_loaded_state(loaded_state, appearance, is_in_split_pane, ctx)
                 }

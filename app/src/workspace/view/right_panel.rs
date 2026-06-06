@@ -8,7 +8,7 @@ use warp_core::features::FeatureFlag;
 use warp_core::ui::Icon;
 use warp_util::path::LineAndColumnArg;
 use warpui::elements::{
-    resizable_state_handle, ChildAnchor, ChildView, Clipped, ConstrainedBox, Container,
+    resizable_state_handle, Align, ChildAnchor, ChildView, Clipped, ConstrainedBox, Container,
     CrossAxisAlignment, DragBarSide, Element, Empty, Flex, MainAxisAlignment, MainAxisSize,
     MouseStateHandle, ParentElement, PositionedElementAnchor, Resizable, ResizableStateHandle,
     Shrinkable, Text,
@@ -17,7 +17,7 @@ use warpui::fonts::{Properties, Weight};
 use warpui::keymap::EditableBinding;
 use warpui::platform::Cursor;
 use warpui::ui_components::components::UiComponent;
-use warpui::ui_components::switch::SwitchStateHandle;
+use warpui::ui_components::switch::{SwitchStateHandle, TooltipConfig};
 use warpui::{
     AppContext, Entity, EntityId, ModelHandle, SingletonEntity, TypedActionView, View, ViewContext,
     ViewHandle, WeakViewHandle,
@@ -565,13 +565,16 @@ impl RightPanelView {
                     .as_ref()
                     .and_then(|s| s.selected_repo_path.clone());
 
-                // The repo the active terminal is inside, used as the default
-                // selection. `None` when the terminal is at a parent folder
-                // (child-repo scan) → the panel shows the list, no auto-load.
-                let preferred = self
-                    .working_directories_model
-                    .as_ref(ctx)
-                    .focused_repo_for_pane_group(*pane_group_id);
+                // The default selection: the repo the active terminal is inside,
+                // or — when the terminal sits at a parent folder (child-repo
+                // scan) — the repo the user last picked for this pane group, so
+                // toggling the scan off/on restores and reloads their selection
+                // instead of dropping back to the empty "pick a repo" prompt.
+                // Stays `None` only on the very first scan with no prior pick.
+                let wd = self.working_directories_model.as_ref(ctx);
+                let preferred = wd
+                    .focused_repo_for_pane_group(*pane_group_id)
+                    .or_else(|| wd.get_selected_review_repo(*pane_group_id).cloned());
 
                 if let Some(state) = self.code_review_state.as_mut() {
                     state.set_available_repos(repositories.clone(), preferred, ctx);
@@ -853,6 +856,12 @@ impl RightPanelView {
                         .ui_builder()
                         .switch(self.scan_child_repos_switch_state.clone())
                         .check(is_on)
+                        .with_tooltip(TooltipConfig {
+                            text: "Scan subfolders for git repos\nWhen the terminal is in a \
+                                   parent folder, list its child repos in the dropdown to review."
+                                .to_string(),
+                            styles: appearance.ui_builder().default_tool_tip_styles(),
+                        })
                         .build()
                         .on_click(move |ctx, _, _| {
                             ctx.dispatch_typed_action(RightPanelAction::ToggleScanChildRepos);
@@ -957,20 +966,19 @@ impl RightPanelView {
                 .with_padding_right(CONTENT_RIGHT_MARGIN)
                 .finish();
 
-                let prompt_body = Container::new(
-                    Flex::column()
-                        .with_main_axis_alignment(MainAxisAlignment::Center)
-                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                        .with_child(
-                            Text::new_inline(
-                                "Select a repository to review its changes.".to_string(),
-                                appearance.ui_font_family(),
-                                appearance.ui_font_size(),
-                            )
-                            .with_color(theme.sub_text_color(theme.background()).into())
-                            .finish(),
-                        )
-                        .finish(),
+                // `Align` (default alignment = center) fills the available body
+                // area and centers the prompt both horizontally and vertically.
+                // A bare `Flex::column` can't center horizontally here — a
+                // column's cross-axis size shrinks to its widest child, so
+                // cross-axis centering is a no-op and the text hugs the left.
+                let prompt_body = Align::new(
+                    Text::new_inline(
+                        "Select a repository to review its changes.".to_string(),
+                        appearance.ui_font_family(),
+                        appearance.ui_font_size(),
+                    )
+                    .with_color(theme.sub_text_color(theme.background()).into())
+                    .finish(),
                 )
                 .finish();
 

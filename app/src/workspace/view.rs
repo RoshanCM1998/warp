@@ -8780,6 +8780,7 @@ impl Workspace {
             ))
         } else {
             let active_pane_group = self.active_tab_pane_group().clone();
+            let pane_group_id = active_pane_group.id();
             // Read repo_path and terminal_view from the pane group (immutable context).
             let read_result = active_pane_group.read(ctx, |pane_group, ctx| {
                 pane_group.active_session_view(ctx).map(|terminal_view| {
@@ -8790,6 +8791,18 @@ impl Workspace {
             });
             // Resolve DiffStateModel outside the read closure (needs mutable context).
             read_result.and_then(|(repo_path, preferred_session, terminal_view)| {
+                // When the terminal sits at a parent folder (no repo of its own),
+                // fall back to the child repo the user last picked for this pane
+                // group — but only if it's still a known repo (scan enabled) — so
+                // reopening the panel restores their review instead of closing it.
+                let repo_path = repo_path.or_else(|| {
+                    let wd = self.working_directories_model.as_ref(ctx);
+                    let candidate = wd.get_selected_review_repo(pane_group_id).cloned()?;
+                    let still_known = wd
+                        .most_recent_repositories_for_pane_group(pane_group_id)
+                        .is_some_and(|mut repos| repos.any(|r| r == candidate));
+                    still_known.then_some(candidate)
+                });
                 let diff_state_model = repo_path.as_ref().and_then(|rp| {
                     self.working_directories_model.update(ctx, |model, ctx| {
                         model.get_or_create_diff_state_model(rp.clone(), preferred_session, ctx)
