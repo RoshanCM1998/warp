@@ -2503,26 +2503,7 @@ impl Input {
                     me.focus_input_box(ctx);
                 }
                 AgentInputFooterEvent::ToggleInlineModelSelector { initial_tab } => {
-                    if me
-                        .suggestions_mode_model
-                        .as_ref(ctx)
-                        .is_inline_model_selector()
-                    {
-                        me.suggestions_mode_model.update(ctx, |model, ctx| {
-                            model.set_mode(InputSuggestionsMode::Closed, ctx);
-                        });
-                        ctx.notify();
-                    } else {
-                        me.close_overlays(false, ctx);
-                        let has_input = !me.editor.as_ref(ctx).buffer_text(ctx).is_empty();
-                        me.inline_model_selector_view.update(ctx, |v, ctx| {
-                            if has_input {
-                                v.set_filter_results_by_input(false);
-                            }
-                            v.set_active_tab(*initial_tab, ctx);
-                        });
-                        me.open_model_selector(ctx);
-                    }
+                    me.toggle_inline_model_selector_from_chip(*initial_tab, ctx);
                 }
                 AgentInputFooterEvent::OpenSettings(section) => {
                     ctx.emit(Event::OpenSettings(*section));
@@ -2636,6 +2617,8 @@ impl Input {
             // Sync the editor text colors with the (now active or inactive)
             // alt-screen CLI agent background so input text stays legible.
             me.update_cli_agent_editor_text_colors(ctx);
+            // Re-sync enter_settings whenever the rich input opens or closes.
+            me.update_cli_agent_enter_settings(ctx);
             me.set_zero_state_hint_text(ctx);
             ctx.notify();
         });
@@ -2833,6 +2816,7 @@ impl Input {
 
                         if !other_agent_view_controller_clone.as_ref(app).is_active()
                             && !cfg!(target_os = "macos")
+                            && !CLIAgentSessionsModel::as_ref(app).is_input_open(terminal_view_id)
                         {
                             context.set.insert(flags::CTRL_ENTER_ENTERS_AGENT_VIEW);
                         }
@@ -4577,14 +4561,14 @@ impl Input {
                     }
                 }
                 // Accept path: close the model selector.
+                let selector_view = self.inline_model_selector_view.as_ref(ctx);
+                let should_restore_buffer = selector_view.prompt_parked_for_search()
+                    || !selector_view.filter_results_by_input();
                 if self
                     .suggestions_mode_model
                     .as_ref(ctx)
                     .is_inline_model_selector()
-                    && !self
-                        .inline_model_selector_view
-                        .as_ref(ctx)
-                        .filter_results_by_input()
+                    && should_restore_buffer
                 {
                     // The user had a pre-existing prompt; restore it (do NOT clear buffer).
                     self.suggestions_mode_model.update(ctx, |model, ctx| {
@@ -4759,12 +4743,68 @@ impl Input {
         }
     }
 
-    fn open_model_selector(&mut self, ctx: &mut ViewContext<Self>) {
+    fn toggle_inline_model_selector_from_chip(
+        &mut self,
+        initial_tab: InlineModelSelectorTab,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if self
+            .suggestions_mode_model
+            .as_ref(ctx)
+            .is_inline_model_selector()
+        {
+            // Toggling closed via the chip: restore the parked prompt if we
+            // cleared it for search, otherwise just close.
+            if self
+                .inline_model_selector_view
+                .as_ref(ctx)
+                .prompt_parked_for_search()
+            {
+                self.suggestions_mode_model.update(ctx, |model, ctx| {
+                    model.close_and_restore_buffer(ctx);
+                });
+            } else {
+                self.suggestions_mode_model.update(ctx, |model, ctx| {
+                    model.set_mode(InputSuggestionsMode::Closed, ctx);
+                });
+            }
+            ctx.notify();
+            return;
+        }
+
+        self.open_model_selector_and_snapshot_prompt(initial_tab, ctx);
+    }
+
+    /// Opens the inline model selector, parking any pre-existing prompt so the
+    /// input can be used to search models. The parked prompt is restored when the
+    /// selector closes (on model selection or dismissal). Shared by the model
+    /// chip, the `/model` keybinding, and the OpenModelSelector action.
+    fn open_model_selector_and_snapshot_prompt(
+        &mut self,
+        initial_tab: InlineModelSelectorTab,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.close_overlays(false, ctx);
+        let has_input = !self.editor.as_ref(ctx).buffer_text(ctx).is_empty();
+        let should_clear_prompt_for_search =
+            has_input && FeatureFlag::RestorePromptOnInlineModelSelectorSearch.is_enabled();
+        self.inline_model_selector_view.update(ctx, |view, ctx| {
+            if has_input && !should_clear_prompt_for_search {
+                view.set_filter_results_by_input(false);
+            }
+            view.set_prompt_parked_for_search(should_clear_prompt_for_search);
+            view.set_active_tab(initial_tab, ctx);
+        });
         self.suggestions_mode_model.update(ctx, |model, ctx| {
             model.set_mode(InputSuggestionsMode::ModelSelector, ctx);
         });
-
         ctx.notify();
+        if should_clear_prompt_for_search {
+            self.editor.update(ctx, |editor, ctx| {
+                editor.system_clear_buffer(false, ctx);
+            });
+        }
+        self.focus_input_box(ctx);
     }
 
     fn open_profile_selector(&mut self, ctx: &mut ViewContext<Self>) {
@@ -6618,6 +6658,11 @@ impl Input {
             #[cfg(feature = "voice_input")]
             AISettingsChangedEvent::VoiceInputEnabled { .. } => {
                 self.update_voice_transcription_options(ctx);
+            }
+            AISettingsChangedEvent::SubmitRichInputOnCtrlEnter { .. } => {
+                // ctrl_enter now depends on the toggle: re-sync so flipping
+                // the setting mid-session takes effect immediately.
+                self.update_cli_agent_enter_settings(ctx);
             }
             _ => {}
         }
@@ -8623,11 +8668,12 @@ impl Input {
     fn should_restore_buffer_on_inline_menu_dismiss(&self, ctx: &ViewContext<Self>) -> bool {
         match self.suggestions_mode_model.as_ref(ctx).mode() {
             // If the input is not being used as a search on the model menu
-            // we should not restore/revert the changes to the input on-dismiss.
-            InputSuggestionsMode::ModelSelector => self
-                .inline_model_selector_view
-                .as_ref(ctx)
-                .filter_results_by_input(),
+            // we should not restore/revert the changes to the input on-dismiss,
+            // unless we parked a prompt to search (then we restore that prompt).
+            InputSuggestionsMode::ModelSelector => {
+                let view = self.inline_model_selector_view.as_ref(ctx);
+                view.prompt_parked_for_search() || view.filter_results_by_input()
+            }
             _ => true,
         }
     }
@@ -10344,9 +10390,7 @@ impl Input {
             }
             EditorEvent::Enter => self.input_enter(ctx),
             EditorEvent::CmdEnter => self.input_cmd_enter(ctx),
-            EditorEvent::CtrlEnter => {
-                ctx.emit(Event::CtrlEnter);
-            }
+            EditorEvent::CtrlEnter => self.input_ctrl_enter(ctx),
             EditorEvent::Escape => self.editor_escape(ctx),
             EditorEvent::CtrlC { cleared_buffer_len } => {
                 self.close_input_suggestions(/*should_focus_input=*/ true, ctx);
@@ -12629,15 +12673,18 @@ impl Input {
                 return;
             }
 
-            // When the `!` prefix was stripped (shell mode in CLI agent input),
-            // prepend it back so the CLI agent receives the mode-switch prefix,
-            // then exit shell mode so the next prompt starts in AI mode.
-            let mut text = self.editor.as_ref(ctx).buffer_text(ctx);
-            if self.is_locked_in_shell_mode(ctx) {
-                text = format!("{TERMINAL_INPUT_PREFIX}{text}");
-                self.exit_shell_mode_to_ai(ctx);
+            // When submit_on_ctrl_enter is enabled, Enter inserts a newline rather than
+            // submitting (Ctrl+Enter handles submission in that mode).
+            // Asymmetry: Enter replaces any active selection (the user asked for a newline
+            // edit); Ctrl+Enter preserves selections because it is a submit, not an edit.
+            if *AISettings::as_ref(ctx).submit_on_ctrl_enter {
+                self.editor.update(ctx, |editor, ctx| {
+                    editor.user_initiated_insert("\n", PlainTextEditorViewAction::NewLine, ctx);
+                });
+                return;
             }
-            ctx.emit(Event::SubmitCLIAgentInput { text });
+
+            self.emit_submit_cli_agent_input(ctx);
             return;
         }
         let command = self.editor.as_ref(ctx).buffer_text(ctx);
@@ -13036,6 +13083,33 @@ impl Input {
             ai_settings.mark_quota_banner_as_dismissed(ctx);
             ctx.notify();
         });
+    }
+
+    /// Submits the rich-input buffer on Ctrl+Enter when `submit_on_ctrl_enter` is enabled;
+    /// otherwise emits [`Event::CtrlEnter`]. Exposed `pub(crate)` for unit tests.
+    pub(crate) fn input_ctrl_enter(&mut self, ctx: &mut ViewContext<Self>) {
+        if CLIAgentSessionsModel::as_ref(ctx).is_input_open(self.terminal_view_id)
+            && *AISettings::as_ref(ctx).submit_on_ctrl_enter
+        {
+            self.emit_submit_cli_agent_input(ctx);
+        } else {
+            ctx.emit(Event::CtrlEnter);
+        }
+    }
+
+    /// Emits [`Event::SubmitCLIAgentInput`] with the current buffer contents.
+    /// Shared submit path for Enter (default mode) and Ctrl+Enter (`submit_on_ctrl_enter` mode);
+    /// callers must have already handled menu-intercept cases.
+    fn emit_submit_cli_agent_input(&mut self, ctx: &mut ViewContext<Self>) {
+        // When the `!` prefix was stripped (shell mode in CLI agent input),
+        // prepend it back so the CLI agent receives the mode-switch prefix,
+        // then exit shell mode so the next prompt starts in AI mode.
+        let mut text = self.editor.as_ref(ctx).buffer_text(ctx);
+        if self.is_locked_in_shell_mode(ctx) {
+            text = format!("{TERMINAL_INPUT_PREFIX}{text}");
+            self.exit_shell_mode_to_ai(ctx);
+        }
+        ctx.emit(Event::SubmitCLIAgentInput { text });
     }
 
     fn input_cmd_enter(&mut self, ctx: &mut ViewContext<Self>) {
@@ -13750,7 +13824,7 @@ impl Input {
         let attachments: Vec<AgentAttachment> = self
             .ai_context_model
             .as_ref(ctx)
-            .pending_context(ctx, true)
+            .pending_context(ctx, true, None)
             .into_iter()
             .filter_map(|context| match context {
                 AIAgentContext::Block(block) => Some(AgentAttachment::BlockReference {
@@ -15336,7 +15410,10 @@ impl TypedActionView for Input {
                 }
             }
             InputAction::OpenModelSelector => {
-                self.open_model_selector(ctx);
+                self.open_model_selector_and_snapshot_prompt(
+                    InlineModelSelectorTab::BaseAgent,
+                    ctx,
+                );
             }
             InputAction::FigmaAddButtonClicked => {
                 TemplatableMCPServerManager::handle(ctx).update(ctx, |manager, ctx| {

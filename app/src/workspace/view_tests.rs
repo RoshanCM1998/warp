@@ -88,7 +88,7 @@ use crate::{
     experiments, workspace, AgentNotificationsModel, GlobalResourceHandlesProvider, ObjectActions,
 };
 
-fn initialize_app(app: &mut App) {
+pub(crate) fn initialize_app(app: &mut App) {
     initialize_settings_for_tests(app);
 
     // Add the necessary singleton models to the App
@@ -143,6 +143,15 @@ fn initialize_app(app: &mut App) {
     app.add_singleton_model(crate::ai::blocklist::QueuedQueryModel::new);
     app.add_singleton_model(|ctx| OrchestrationPillBarModel::new(Default::default(), ctx));
     app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+    // The blocklist controller created during terminal bootstrap subscribes to
+    // OrchestrationEventService and OrchestrationEventStreamer unconditionally,
+    // so both singletons must be registered before bootstrap.
+    app.add_singleton_model(
+        crate::ai::blocklist::orchestration_events::OrchestrationEventService::new,
+    );
+    app.add_singleton_model(
+        crate::ai::blocklist::orchestration_event_streamer::OrchestrationEventStreamer::new,
+    );
     app.add_singleton_model(|_| ActiveAgentViewsModel::new());
     app.add_singleton_model(AgentNotificationsModel::new);
     app.add_singleton_model(AgentConversationsModel::new);
@@ -229,7 +238,7 @@ fn initialize_app(app: &mut App) {
     app.update(workspace::init);
 }
 
-fn mock_workspace(app: &mut App) -> ViewHandle<Workspace> {
+pub(crate) fn mock_workspace(app: &mut App) -> ViewHandle<Workspace> {
     let global_resource_handles = GlobalResourceHandles::mock(app);
     let active_window_id = app.read(|ctx| ctx.windows().active_window());
     let (_, workspace) = app.add_window(WindowStyle::NotStealFocus, |ctx| {

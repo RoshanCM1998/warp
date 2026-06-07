@@ -20,8 +20,6 @@ const MAX_FILE_SIZE: usize = 3 * 1000 * 1000;
 
 /// Maximum number of files to load when lazy-loading a directory
 pub const LAZY_LOAD_FILE_LIMIT: usize = 5000;
-/// Maximum relative depth to inspect below a lazy node for standing query matches.
-const STANDING_QUERY_MAX_DEPTH: usize = 3;
 
 #[derive(Debug, Error)]
 pub enum BuildTreeError {
@@ -105,42 +103,6 @@ impl Entry {
             Self::Directory(directory) => &directory.path,
         }
     }
-    fn collect_standing_descendants(
-        directory: &Path,
-        current_depth: usize,
-        state: &mut StandingQueryBuildState<'_>,
-    ) {
-        if current_depth >= STANDING_QUERY_MAX_DEPTH {
-            return;
-        }
-        let Ok(entries) = std::fs::read_dir(directory) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_symlink() && path.is_dir() {
-                continue;
-            }
-            let path = if path.is_symlink() {
-                path
-            } else {
-                match dunce::canonicalize(path) {
-                    Ok(path) => path,
-                    Err(_) => continue,
-                }
-            };
-            if is_git_internal_path(&path) {
-                continue;
-            }
-            let is_directory = path.is_dir();
-            state
-                .results
-                .record_path(&path, is_directory, state.definitions);
-            if is_directory {
-                Self::collect_standing_descendants(&path, current_depth + 1, state);
-            }
-        }
-    }
 
     pub fn loaded(&self) -> bool {
         match self {
@@ -157,7 +119,8 @@ impl Entry {
     }
 
     /// Builds a tree of entries from a given path, handling gitignored files and directories.
-    /// After max_depth is reached, all children are lazy-loaded to prevent deeply nested trees.
+    /// After max_depth is reached, children outside force-included paths are lazy-loaded to
+    /// prevent deeply nested trees.
     /// IgnoredPathStrategy determines what happens when ignored files are encountered.
     /// `budget_exceeded_behavior` controls what happens once the file budget is
     /// exhausted (see [`BudgetExceededBehavior`]).
@@ -314,11 +277,6 @@ impl Entry {
                 Ok(Self::File(metadata))
             }
             EvaluatedEntry::Directory { ignored, lazy } => {
-                if lazy {
-                    if let Some(state) = standing_queries.as_deref_mut() {
-                        Self::collect_standing_descendants(&root_path, 0, state);
-                    }
-                }
                 nodes.push(Some(NodeBuilder::Dir {
                     path: root_path.clone(),
                     ignored,
@@ -356,9 +314,6 @@ impl Entry {
                         }
                     };
                     if !should_expand {
-                        if let Some(state) = standing_queries.as_deref_mut() {
-                            Self::collect_standing_descendants(&job.path, 0, state);
-                        }
                         continue;
                     }
 
@@ -386,11 +341,17 @@ impl Entry {
                         };
                         let entry_path = entry.path();
 
-                        // Skip symlinks to folders before canonicalization to
-                        // prevent duplicates. Symlinks to files are kept as-is,
-                        // since canonicalization would point at the real file.
+                        // Do not materialize directory symlinks in the canonical tree. Standing
+                        // project-skill queries still follow eligible provider children locally
+                        // and retain their lexical paths in the result set.
                         let canonical_path = if entry_path.is_symlink() {
                             if entry_path.is_dir() {
+                                if let Some(state) = standing_queries.as_deref_mut() {
+                                    state.results.record_followed_project_skill_directory(
+                                        &entry_path,
+                                        state.definitions,
+                                    );
+                                }
                                 None
                             } else {
                                 Some(entry_path)
@@ -442,11 +403,7 @@ impl Entry {
                                 // without a matching force-included path) stay
                                 // unloaded. Everything else is queued for
                                 // expansion, subject to the budget gate above.
-                                if lazy {
-                                    if let Some(state) = standing_queries.as_deref_mut() {
-                                        Self::collect_standing_descendants(&child_path, 0, state);
-                                    }
-                                } else {
+                                if !lazy {
                                     queue.push_back(DirJob {
                                         index: child_index,
                                         path: child_path,
@@ -624,8 +581,11 @@ fn evaluate_entry(
             false, /* check_ancestors */
         );
 
-    // If we've reached the max depth, force lazy-loading even of non-ignored folders.
-    let mut lazy = current_depth >= options.max_depth;
+    let force_included = matches_force_included_path(curr_path, options.force_included_paths);
+
+    // If we've reached the max depth, force lazy-loading even of non-ignored folders unless the
+    // folder is on the path to a force-included subtree.
+    let mut lazy = current_depth >= options.max_depth && !force_included;
 
     if path_is_ignored {
         match options.ignored_path_strategy {
@@ -638,7 +598,7 @@ fn evaluate_entry(
                 }
             }
             IgnoredPathStrategy::IncludeLazy => {
-                lazy = !matches_force_included_path(curr_path, options.force_included_paths);
+                lazy = !force_included;
             }
             IgnoredPathStrategy::Include => {}
         }
@@ -682,7 +642,8 @@ fn push_child(nodes: &mut [Option<NodeBuilder>], parent: usize, child: usize) {
 }
 
 /// Recursively assembles the nested [`Entry`] tree from the build arena.
-/// Recursion depth is bounded by `BuildTreeOptions::max_depth`.
+/// Recursion depth is normally bounded by `BuildTreeOptions::max_depth`, except for force-included
+/// subtrees.
 fn assemble_node(nodes: &mut [Option<NodeBuilder>], index: usize) -> Entry {
     match nodes[index]
         .take()

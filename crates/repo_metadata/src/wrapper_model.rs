@@ -15,7 +15,8 @@ use warpui_core::{AppContext, ModelContext, ModelHandle, SingletonEntity};
 use crate::file_tree_store::FileTreeState;
 use crate::file_tree_update::{MetadataUpdateType, RepoMetadataUpdate};
 use crate::local_model::{
-    GetContentsArgs, IndexedRepoState, LocalRepoMetadataModel, RepoContent, RepositoryMetadataEvent,
+    GetContentsArgs, IndexedRepoState, LocalRepoMetadataModel, RepoContents,
+    RepositoryMetadataEvent,
 };
 use crate::remote_model::{RemoteRepoMetadataModel, RemoteRepositoryMetadataEvent};
 use crate::repository_identifier::{RemoteRepositoryIdentifier, RepositoryIdentifier};
@@ -267,14 +268,17 @@ impl RepoMetadataModel {
 
     /// Returns repository contents for the specified repository.
     ///
-    /// Returns an error if the number of results exceeds MAX_REPO_CONTENTS_RESULTS.
+    /// The number of returned entries is capped; when the repository contains
+    /// more matching entries, the result is truncated and
+    /// [`RepoContents::truncated`] is set to `true`.
+    ///
     /// Returns an error if the repository is not indexed, indexing is pending, or indexing failed.
     pub fn get_repo_contents<'a>(
         &self,
         id: &RepositoryIdentifier,
         args: GetContentsArgs,
         ctx: &'a AppContext,
-    ) -> Result<Vec<RepoContent<'a>>, RepoMetadataError> {
+    ) -> Result<RepoContents<'a>, RepoMetadataError> {
         match id {
             RepositoryIdentifier::Local(path) => {
                 self.local.as_ref(ctx).get_repo_contents(path, args)
@@ -298,6 +302,18 @@ impl RepoMetadataModel {
     // ── Local-specific operations ────────────────────────────────────
     // These delegate to the local sub-model. Remote equivalents will be
     // added once the remote client ↔ server sync layer is in place.
+
+    /// Fully indexes a local directory identified by a standardized path.
+    #[cfg(feature = "local_fs")]
+    pub fn index_local_directory_path(
+        &self,
+        path: &StandardizedPath,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<(), RepoMetadataError> {
+        let path = path.clone();
+        self.local
+            .update(ctx, |local, ctx| local.index_directory_path(&path, ctx))
+    }
 
     /// Indexes a local repository from the given repository handle.
     #[cfg(feature = "local_fs")]

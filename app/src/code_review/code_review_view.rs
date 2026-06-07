@@ -4134,14 +4134,13 @@ impl CodeReviewView {
                     .with_margin_top(16.)
                     .finish(),
             );
-        } else if let Some(repo_path) = self.repo_path().and_then(LocalOrRemotePath::to_local_path)
-        {
+        } else if let Some(repo_path) = self.repo_path() {
             // Check for initialized project-scoped rules.
             if let Some(rules) =
                 ProjectContextModel::as_ref(app).find_applicable_project_rules(repo_path)
             {
                 if let Some(first_rule) = rules.active_rules.first() {
-                    if let Some(file_name) = first_rule.path.file_name().and_then(|n| n.to_str()) {
+                    if let Some(file_name) = first_rule.path.file_name() {
                         zero_state_column.add_child(
                             Container::new(
                                 Text::new(
@@ -6564,6 +6563,24 @@ impl CodeReviewView {
     /// Updates the primary git operations button, chevron visibility, and
     /// related state to match the current [`PrimaryGitActionMode`].
     fn update_git_operations_ui(&mut self, ctx: &mut ViewContext<Self>) {
+        // Disable the button for remote sessions.
+        if self.repo_path().is_some_and(LocalOrRemotePath::is_remote) {
+            const REMOTE_TOOLTIP: &str = "Git operations aren't available in remote sessions";
+            self.git_primary_action_button.update(ctx, |button, ctx| {
+                button.set_label("Commit", ctx);
+                button.set_icon(Some(Icon::GitCommit), ctx);
+                button.set_disabled(true, ctx);
+                button.set_tooltip(Some(REMOTE_TOOLTIP), ctx);
+                button.set_adjoined_side(AdjoinedSide::Right, ctx);
+            });
+            self.git_operations_chevron.update(ctx, |button, ctx| {
+                button.set_disabled(true, ctx);
+                button.set_tooltip(Some(REMOTE_TOOLTIP), ctx);
+            });
+            ctx.notify();
+            return;
+        }
+
         let mode = self.primary_git_action_mode(ctx);
 
         match mode {

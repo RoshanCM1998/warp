@@ -2522,6 +2522,12 @@ pub struct TerminalView {
     /// but also the input.
     resize_tx: Sender<Vector2F>,
 
+    /// Exchange that `jump_to_latest_agent_message` wants to scroll to once the
+    /// agent view's blocks have mounted. Set when entering the agent view from the
+    /// terminal (where the target block doesn't exist yet on the current frame) and
+    /// consumed in `after_terminal_view_layout`, after layout has mounted it.
+    pending_agent_scroll_target: Option<AIAgentExchangeId>,
+
     find_link_tx: Sender<FindLinkArg>,
 
     /// Highlighted link (could be url or file path) on the screen.
@@ -2798,8 +2804,7 @@ pub struct TerminalView {
     agent_view_controller: ModelHandle<AgentViewController>,
     agent_view_back_button: ViewHandle<ActionButton>,
     /// Pill bar shown above the agent view header listing the orchestrator and
-    /// child agents. Gated by `FeatureFlag::OrchestrationPillBar`. The view is
-    /// always constructed; render-time guards control whether it draws anything.
+    /// child agents. Always constructed; render-time guards control whether it draws anything.
     orchestration_pill_bar: ViewHandle<OrchestrationPillBar>,
     /// `true` when this view hosts a child agent split off into its own
     /// pane/tab. Drives breadcrumb-vs-pill-bar rendering in the pane header.
@@ -3967,10 +3972,16 @@ impl TerminalView {
         );
 
         let block_list_settings_handle = BlockListSettings::handle(ctx);
-        ctx.subscribe_to_model(&block_list_settings_handle, |_, _, evt, ctx| match evt {
-            BlockListSettingsChangedEvent::ShowJumpToBottomOfBlockButton { .. } => ctx.notify(),
-            BlockListSettingsChangedEvent::SnackbarEnabled { .. } => ctx.notify(),
-            BlockListSettingsChangedEvent::ShowBlockDividers { .. } => ctx.notify(),
+        ctx.subscribe_to_model(&block_list_settings_handle, |me, _, evt, ctx| match evt {
+            BlockListSettingsChangedEvent::ShowJumpToBottomOfBlockButton { .. }
+            | BlockListSettingsChangedEvent::SnackbarEnabled { .. }
+            | BlockListSettingsChangedEvent::ShowBlockDividers { .. } => ctx.notify(),
+            BlockListSettingsChangedEvent::PreserveInputFocusOnBlockSelection { .. } => {
+                // Fires for every terminal view, so use the focus-gated variant to avoid
+                // stealing focus from another pane or Settings.
+                me.redetermine_terminal_focus(ctx);
+                ctx.notify();
+            }
         });
 
         ctx.subscribe_to_model(&SessionSettings::handle(ctx), move |me, _, evt, ctx| {
@@ -4195,6 +4206,7 @@ impl TerminalView {
             auth_state: AuthStateProvider::as_ref(ctx).get().clone(),
             find_bar,
             resize_tx,
+            pending_agent_scroll_target: None,
             find_link_tx,
             highlighted_link: HighlightedLinkOption::default(),
             last_hover_fragment_boundary: None,
@@ -5111,10 +5123,6 @@ impl TerminalView {
 
             let mut finish_reason: Option<FinishReason> = None;
             if let Some(active_ai_block) = self.active_ai_block(ctx) {
-                // Focus the block so that the user can interact
-                // with any blocking actions (if any).
-                self.focus_ai_block_if_self_focused(active_ai_block, ctx);
-
                 // A new exchange is already active, so callbacks for the
                 // just-finished exchange will be skipped. Clear any pending
                 // user query now to prevent its callback from firing when
@@ -7794,9 +7802,7 @@ impl TerminalView {
         let focus_reporting_enabled = *AltScreenReporting::as_ref(ctx)
             .focus_reporting_enabled
             .value();
-        focus_reporting_enabled
-            && model.is_alt_screen_active()
-            && model.alt_screen().is_mode_set(TermMode::FOCUS_IN_OUT)
+        focus_reporting_enabled && model.is_term_mode_set(TermMode::FOCUS_IN_OUT)
     }
 
     fn maybe_report_focus_in(&mut self, ctx: &mut ViewContext<Self>) {
@@ -16109,6 +16115,15 @@ impl TerminalView {
     /// size of the entire terminal (block_list + input OR alt-grid OR shared session viewer loading) as its
     /// argument.
     fn after_terminal_view_layout(&mut self, size: Vector2F, ctx: &mut ViewContext<Self>) {
+        // A pending `jump_to_latest_agent_message` enters the agent view, which
+        // mounts the target block over this layout. Now that layout is done the
+        // block exists, so scroll to it — once. Doing it here (after layout, after
+        // the agent view's own entry scroll) means a single shot lands without any
+        // retry loop. Each agent turn is one block, so this lands on its top.
+        if let Some(exchange_id) = self.pending_agent_scroll_target.take() {
+            self.scroll_to_exchange(exchange_id, ctx);
+        }
+
         let size_update = SizeUpdateBuilder::after_layout(*self.size_info, size).build(self, ctx);
         self.resize_internal(size_update, ctx);
 
@@ -19571,12 +19586,14 @@ impl TerminalView {
             ctx.notify();
         });
 
-        // In Agent Mode, block selection is used to attach blocks as context. To allow users to
-        // submit queries quickly, we don't want to divert the focus away from the input box. With
-        // AgentView enabled, blocks can be attached as context in terminal mode too.
-        if !self.ai_input_model.as_ref(ctx).is_ai_input_enabled()
-            && !FeatureFlag::AgentView.is_enabled()
-        {
+        // In AI input mode, block selection is used to attach blocks as context. To allow users to
+        // submit queries quickly, we don't want to divert the focus away from the input box.
+        //
+        // In shell mode, selecting a block should focus the terminal so blocklist navigation keeps
+        // working, unless the user has opted to preserve input focus on block selection.
+        let preserve_input_focus =
+            *BlockListSettings::as_ref(ctx).preserve_input_focus_on_block_selection;
+        if !self.ai_input_model.as_ref(ctx).is_ai_input_enabled() && !preserve_input_focus {
             self.focus_terminal(ctx);
         }
 
@@ -20556,11 +20573,12 @@ impl TerminalView {
             // Leave the input box focused when selecting blocks or text as context in AI input
             // mode so users can quickly submit queries.
             //
-            // In the new modality, block selection always represents context attachment and the
-            // input should remain focused.
-            let has_block_or_text_selection_in_shell_mode = is_shell_mode
-                && !FeatureFlag::AgentView.is_enabled()
-                && (are_blocks_selected || is_text_selected);
+            // In shell mode, selected blocks/text should focus the terminal so blocklist
+            // navigation continues to work, unless the user has opted to preserve input focus.
+            let preserve_input_focus =
+                *BlockListSettings::as_ref(ctx).preserve_input_focus_on_block_selection;
+            let has_block_or_text_selection_in_shell_mode =
+                is_shell_mode && !preserve_input_focus && (are_blocks_selected || is_text_selected);
 
             has_active_user_terminal_command || has_block_or_text_selection_in_shell_mode
         };
@@ -22086,6 +22104,79 @@ impl TerminalView {
         }
     }
 
+    fn jump_to_latest_agent_message(&mut self, ctx: &mut ViewContext<Self>) {
+        // Agent messages only render inside the agent view; in the terminal they
+        // collapse to a hidden, zero-height block. So "jump to latest agent
+        // message" makes sure we're in the agent view for the most recent
+        // conversation and then scrolls to its latest exchange.
+        if !FeatureFlag::AgentView.is_enabled() {
+            return;
+        }
+        // Follow actual agent activity. Prefer the active conversation — the one
+        // currently or most recently streaming, which tracks where the latest
+        // agent message landed even after the user switches back to an older
+        // conversation — and target its latest visible exchange. When there is no
+        // active conversation, fall back to the single most-recently-streamed
+        // exchange across all conversations (rather than the most-recently-
+        // *created* conversation) and enter the conversation that owns it.
+        let history = BlocklistAIHistoryModel::as_ref(ctx);
+        let (conversation_id, exchange_id) =
+            if let Some(active_conversation_id) = history.active_conversation_id(self.id()) {
+                // Resolve the target exchange from the conversation model rather than
+                // from the currently-mounted blocks: when entering from the terminal
+                // the blocks mount over later frames, so the latest block may not
+                // exist yet this tick. Use the latest *visible* exchange so we land on
+                // a block that actually renders (skipping passive/hidden exchanges).
+                let Some(exchange_id) = history
+                    .conversation(&active_conversation_id)
+                    .and_then(|conversation| conversation.latest_visible_exchange())
+                    .map(|exchange| exchange.id)
+                else {
+                    return;
+                };
+                (active_conversation_id, exchange_id)
+            } else {
+                let Some(exchange_id) = history
+                    .latest_exchange_across_all_conversations(self.id())
+                    .map(|exchange| exchange.id)
+                else {
+                    return;
+                };
+                let Some(conversation_id) =
+                    history.conversation_id_for_exchange(exchange_id, self.id())
+                else {
+                    return;
+                };
+                (conversation_id, exchange_id)
+            };
+        // Only re-enter the agent view when we're not already in this
+        // conversation's view; re-entering when already there is needless churn.
+        let already_in_view = self
+            .agent_view_controller
+            .as_ref(ctx)
+            .agent_view_state()
+            .active_conversation_id()
+            == Some(conversation_id);
+        if already_in_view {
+            // Blocks are already mounted, so the exchange resolves immediately.
+            self.scroll_to_exchange(exchange_id, ctx);
+        } else {
+            self.enter_agent_view_for_conversation(
+                None,
+                AgentViewEntryOrigin::JumpToLatestAgentMessage,
+                conversation_id,
+                ctx,
+            );
+            // The target block doesn't exist on this frame — entering the agent view
+            // mounts it over the following layout. Record it and let
+            // `after_terminal_view_layout` scroll once the block is mounted, which
+            // also runs after the agent view's own entry scroll so it isn't
+            // overridden.
+            self.pending_agent_scroll_target = Some(exchange_id);
+        }
+        send_telemetry_from_ctx!(TelemetryEvent::JumpToLatestAgentMessage, ctx);
+    }
+
     fn terminal_down(&mut self, ctx: &mut ViewContext<Self>) {
         if !self.selected_blocks.is_empty() {
             let input_mode = *InputModeSettings::as_ref(ctx).input_mode.value();
@@ -22468,10 +22559,15 @@ impl TerminalView {
             ctx,
         );
 
-        let context = self
-            .ai_context_model
+        let current_working_directory_location = self
+            .active_session
             .as_ref(ctx)
-            .pending_context(ctx, true /* is_user_query */);
+            .current_working_directory_location(ctx);
+        let context = self.ai_context_model.as_ref(ctx).pending_context(
+            ctx,
+            true, /* is_user_query */
+            current_working_directory_location.as_ref(),
+        );
 
         let code_review_input = AIAgentInput::CodeReview {
             context: context.into(),
@@ -25615,6 +25711,7 @@ impl TypedActionView for TerminalView {
             | SelectNextBlock
             | SelectBookmarkUp
             | SelectBookmarkDown
+            | JumpToLatestAgentMessage
             | Up
             | Down
             | JumpToBookmark(_)
@@ -26136,6 +26233,7 @@ impl TypedActionView for TerminalView {
                 InputMode::PinnedToBottom | InputMode::Waterfall => self.bookmark_down(ctx),
                 InputMode::PinnedToTop => self.bookmark_up(ctx),
             },
+            JumpToLatestAgentMessage => self.jump_to_latest_agent_message(ctx),
             BookmarkSelectedBlock => self.bookmark_selected_block(ctx),
             UserInputSequence(bytes) => self.user_input_sequence(bytes, ctx),
             ControlSequence(bytes) => self.control_sequence_on_terminal(bytes, ctx),
