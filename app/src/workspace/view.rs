@@ -8833,10 +8833,9 @@ impl Workspace {
             });
             // Resolve DiffStateModel outside the read closure (needs mutable context).
             read_result.and_then(|(repo_path, preferred_session, terminal_view)| {
-                // When the terminal sits at a parent folder (no repo of its own),
-                // fall back to the child repo the user last picked for this pane
-                // group — but only if it's still a known repo (scan enabled) — so
-                // reopening the panel restores their review instead of closing it.
+                // Terminal in a parent folder (no repo): fall back to the last
+                // picked child repo, if still known, so reopening the panel
+                // restores the review instead of closing it.
                 let repo_path = repo_path.or_else(|| {
                     let wd = self.working_directories_model.as_ref(ctx);
                     let candidate = wd.get_selected_review_repo(pane_group_id).cloned()?;

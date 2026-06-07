@@ -219,12 +219,9 @@ impl CodeReviewState {
 
         self.update_repo_dropdown(ctx);
 
-        // Default selection: the repo the terminal is currently inside
-        // (`preferred_selection`), or the sole repo when there's only one.
-        // When neither applies — e.g. the terminal sits in a parent folder and
-        // multiple child repos were discovered — leave nothing selected so the
-        // user picks from the dropdown (we don't auto-load a repo's diff, which
-        // could be an expensive one).
+        // Default selection: the repo the terminal is inside, or the sole repo.
+        // Otherwise (parent folder with multiple child repos) leave it unselected
+        // so the user picks — we don't auto-load a potentially expensive diff.
         if self.selected_repo_path.is_none() {
             let to_select = preferred_selection
                 .filter(|repo| self.available_repos.contains(repo))
@@ -779,10 +776,9 @@ impl RightPanelView {
         if state.available_repos.len() <= 1 {
             return None;
         }
-        // Only impose a wide minimum when nothing is selected, so the dropdown
-        // stays clickable in the empty "pick a repo" state (child-repo scan).
-        // Once a repo is selected, let it size to the name so a short name like
-        // "smartmoving-crew" doesn't leave dead space before the toggle.
+        // Wide minimum only when nothing is selected (keeps the empty "pick a
+        // repo" state clickable); once selected, size to the name so a short one
+        // doesn't leave dead space before the toggle.
         let min_width = if state.selected_repo_path.is_some() {
             0.
         } else {
@@ -968,11 +964,8 @@ impl RightPanelView {
                 .with_padding_right(CONTENT_RIGHT_MARGIN)
                 .finish();
 
-                // `Align` (default alignment = center) fills the available body
-                // area and centers the prompt both horizontally and vertically.
-                // A bare `Flex::column` can't center horizontally here — a
-                // column's cross-axis size shrinks to its widest child, so
-                // cross-axis centering is a no-op and the text hugs the left.
+                // `Align` fills the body and centers both axes; a `Flex::column`
+                // can't center horizontally here (its width shrinks to the text).
                 let prompt_body = Align::new(
                     Text::new_inline(
                         "Select a repository to review its changes.".to_string(),
@@ -1859,11 +1852,9 @@ impl RightPanelView {
                 .is_some_and(|mut repos| repos.any(|r| &r == repo_path));
 
             let terminal_view = if is_known_repo {
-                // Prefer the terminal sitting in this repo. Child repos surfaced
-                // by the "scan child repos" toggle have NO terminal of their own
-                // (no terminal cd'd into them), so fall back to the active
-                // session — otherwise the review view is never created and the
-                // panel hangs on the loading skeleton.
+                // Prefer the terminal in this repo. Scanned child repos have no
+                // terminal of their own, so fall back to the active session —
+                // else the view is never created and the panel hangs.
                 self.working_directories_model
                     .as_ref(ctx)
                     .get_terminal_id_for_root_path(pane_group_id, repo_path)

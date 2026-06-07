@@ -318,15 +318,10 @@ pub fn update_index_set(
     }
 }
 
-/// Whether a code review view for `path` should be kept alive for a pane group.
-///
-/// A view is "active" if a terminal is cd'd into its repo (`terminal_mapping`)
-/// OR the repo is one of the pane group's known roots (`known_repos`). The
-/// latter clause is what keeps child repos surfaced by the "scan child repos"
-/// toggle alive: they have no terminal of their own, so without it their view
-/// would be evicted right after creation (→ panel stuck on "Loading…"). This is
-/// a free function so the retain logic is unit-testable without constructing a
-/// full `CodeReviewView`.
+/// Whether a code review view for `path` should be kept alive: a terminal is
+/// cd'd into its repo, OR it's one of the pane group's known roots. The second
+/// clause keeps scanned child repos (which have no terminal of their own) from
+/// being evicted right after creation. Free fn so the retain logic is testable.
 #[cfg(feature = "local_fs")]
 fn code_review_view_is_active(
     path: &LocalOrRemotePath,
@@ -492,17 +487,9 @@ impl WorkingDirectoriesModel {
             return;
         };
 
-        // A repo is "active" if a terminal is cd'd into it OR it's one of the
-        // pane group's known repository roots. Child repos surfaced by the
-        // "scan child repos" toggle have NO terminal of their own, so they are
-        // absent from `directory_to_terminal`. Retaining only terminal-mapped
-        // paths would evict a scanned-child's CodeReviewView immediately after
-        // it's stored — dropping the cache's only strong ref, letting the view
-        // get garbage-collected, and killing its DiffStateModel subscription
-        // before the diff finishes loading (→ panel stuck on "Loading open
-        // changes…"). `repository_roots` is the set backing the repo dropdown,
-        // so it includes scanned children and shrinks when the scan is disabled
-        // or the cwd changes — the correct lifetime for these views.
+        // Also retain views for known repository roots, not just terminal-mapped
+        // repos — scanned child repos have no terminal and would otherwise be
+        // evicted mid-load. See `code_review_view_is_active`.
         let known_repos = self.repository_roots.get(pane_group_id);
         let Some(code_review_views) = self.code_review_views.get_mut(&pane_group_id) else {
             return;
@@ -633,10 +620,9 @@ impl WorkingDirectoriesModel {
         terminal_cwds: Vec<(EntityId, LocalOrRemotePath)>,
         editor_paths: Vec<(EntityId, LocalOrRemotePath)>,
         focused_terminal_id: Option<EntityId>,
-        // When true ("scan child repos" toggle), working directories that are
-        // not themselves inside a git repo also contribute their direct child
-        // repos to the pane group's repo set. Passed in (rather than read from
-        // settings here) so this model stays settings-agnostic and testable.
+        // "scan child repos" toggle: also surface direct child repos of dirs
+        // that aren't themselves repos. Passed in to keep this model
+        // settings-agnostic and testable.
         scan_child_repos: bool,
         ctx: &mut ModelContext<Self>,
     ) {
@@ -779,13 +765,10 @@ impl WorkingDirectoriesModel {
             .filter_map(|dir| self.get_repo_root_for_path(dir, ctx))
             .collect();
 
-        // When "scan child repos" is enabled, also surface the direct child git
-        // repos of any working directory that is NOT itself inside a repo. A
-        // parent directory sits *above* its child repos, so the upward
-        // `get_repo_root_for_path` resolution above can never find them — query
-        // the dedicated downward accessor instead. (The repos themselves are
-        // discovered/registered asynchronously by `detect_child_git_repos`;
-        // here we just read whatever has been registered for these dirs.)
+        // Also surface direct child repos of non-repo dirs. The upward
+        // resolution above sits inside its result and can't find them, so use
+        // the downward accessor. Repos are registered async by
+        // `detect_child_git_repos`; here we just read what's registered.
         if scan_child_repos {
             let candidate_dirs: Vec<PathBuf> = self
                 .pane_groups
@@ -919,10 +902,9 @@ impl WorkingDirectoriesModel {
             self.emit_directories_changed(pane_group_id, ctx);
         }
 
-        // Store the focused repo BEFORE emitting RepositoriesChanged so the
-        // code-review panel can read it (via `focused_repo_for_pane_group`) to
-        // decide the default selection — the repo the active terminal is inside.
-        // The event below still only fires when the focused repo changed.
+        // Store focused repo before emitting RepositoriesChanged so the panel
+        // can read it (via `focused_repo_for_pane_group`) for the default
+        // selection. The change event below still only fires on an actual change.
         let focused_repo_changed = old_focused_repo != focused_repo;
         self.focused_repo
             .insert(pane_group_id, focused_repo.clone());
@@ -937,11 +919,9 @@ impl WorkingDirectoriesModel {
         }
     }
 
-    /// Returns the repository the pane group's active terminal is inside (the
-    /// "focused" repo), if any. The code-review panel uses this to pick a
-    /// default repo to review — when the terminal sits in a parent folder
-    /// (child-repo scan), this is `None`, so the panel shows the repo list
-    /// without auto-loading any repo's diff.
+    /// The repository the pane group's active terminal is inside, if any. Used
+    /// as the code-review panel's default selection; `None` when the terminal
+    /// sits in a parent folder (child-repo scan), so nothing auto-loads.
     pub fn focused_repo_for_pane_group(
         &self,
         pane_group_id: EntityId,
