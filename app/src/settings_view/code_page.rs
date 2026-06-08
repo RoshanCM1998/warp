@@ -635,7 +635,7 @@ pub enum CodeSettingsPageEvent {
 }
 
 // Define the code page actions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CodeSettingsPageAction {
     ToggleCodebaseContext,
     ToggleAutoIndexing,

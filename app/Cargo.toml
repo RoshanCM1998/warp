@@ -674,6 +674,7 @@ default = [
     "billing_and_usage_page_v2",
     "remote_code_review",
     "git_operations_in_code_review",
+    "side_by_side_diff_layout",
 ]
 side_by_side_diff_layout = []
 # Enable this feature to automatically perform heap profiling.  NOTE: This will
