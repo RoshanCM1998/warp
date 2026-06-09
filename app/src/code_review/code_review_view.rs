@@ -263,7 +263,7 @@ const EDITOR_GAP: f32 = 12.;
 /// Best-guess height of a staging-area section header (label row + divider). Used as a
 /// fallback for the sticky-header offset before the header has been measured. If the
 /// header styling changes substantially, update this value.
-const STAGING_SECTION_HEADER_HEIGHT: f32 = 32.;
+const STAGING_SECTION_HEADER_HEIGHT: f32 = 36.;
 const FILE_SIDEBAR_PANE_WIDTH_PERCENTAGE: f32 = 0.25;
 /// Vertical gap between the right panel header row and the code review content below it
 /// (sub-header in loaded state, loading text in loading state).
@@ -5005,11 +5005,11 @@ impl CodeReviewView {
                         .to_warpui_icon(warp_core::ui::theme::Fill::Solid(icon_color.into()))
                         .finish(),
                 )
-                .with_width(14.)
-                .with_height(14.)
+                .with_width(12.)
+                .with_height(12.)
                 .finish(),
             )
-            .with_margin_right(6.)
+            .with_margin_right(8.)
             .finish(),
         );
         // Uppercase, muted label (VS Code SCM style) so the section reads as a group title
@@ -5025,32 +5025,36 @@ impl CodeReviewView {
                 .soft_wrap(false)
                 .finish(),
             )
-            .with_margin_right(6.)
+            .with_margin_right(8.)
             .finish(),
         );
-        // Count badge.
+        // Subtle, compact count pill.
         row.add_child(
             Container::new(
                 Text::new(
                     count.to_string(),
                     appearance.ui_font_family(),
-                    appearance.ui_font_size() - 1.,
+                    appearance.ui_font_size() - 2.,
                 )
                 .with_color(label_color.into())
                 .soft_wrap(false)
                 .finish(),
             )
             .with_horizontal_padding(6.)
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+            .with_vertical_padding(1.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(9.)))
             .with_background(warp_core::ui::theme::Fill::Solid(internal_colors::neutral_3(
                 theme,
             )))
             .finish(),
         );
 
-        let header_row = Hoverable::new(mouse_state, |_mouse_state| {
+        // No hard divider — separation comes from generous top space above each section and
+        // the header hugging the file cards beneath it (clean, VS Code SCM style).
+        Hoverable::new(mouse_state, |_mouse_state| {
             Container::new(row.finish())
-                .with_vertical_padding(6.)
+                .with_padding_top(14.)
+                .with_padding_bottom(6.)
                 .with_horizontal_padding(8.)
                 .finish()
         })
@@ -5058,24 +5062,7 @@ impl CodeReviewView {
             ctx.dispatch_typed_action(toggle_action.clone());
         })
         .with_cursor(Cursor::PointingHand)
-        .finish();
-
-        // Thin full-width divider beneath the header to delineate the section group.
-        let divider = Container::new(
-            ConstrainedBox::new(Empty::new().finish())
-                .with_height(1.)
-                .finish(),
-        )
-        .with_background(warp_core::ui::theme::Fill::Solid(internal_colors::neutral_3(
-            theme,
-        )))
-        .finish();
-
-        Flex::column()
-            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-            .with_child(header_row)
-            .with_child(divider)
-            .finish()
+        .finish()
     }
 
     fn render_file_sidebar_row(
@@ -5297,7 +5284,15 @@ impl CodeReviewView {
         // every file in that section.
         if section_collapsed {
             return match section_header {
-                Some(header) => Container::new(header).with_margin_bottom(EDITOR_GAP).finish(),
+                // A collapsed section shows only its header, wrapped in a complete (all sides,
+                // all corners) section border so it still reads as a self-contained group.
+                Some(header) => self.wrap_section_item(
+                    SavePosition::new(header, &self.staging_section_header_position(file_index))
+                        .finish(),
+                    true,
+                    true,
+                    appearance,
+                ),
                 None => Empty::new().finish(),
             };
         }
@@ -5386,12 +5381,22 @@ impl CodeReviewView {
             content.add_child(stack.finish());
         }
 
+        let staging_on = self.staging_area_enabled(app);
+        let is_section_first = section_header.is_some();
+        let is_section_last = staging_on
+            && match file.file_diff.staging_section {
+                StagingSection::Staged => file_index + 1 == self.staged_file_count(),
+                StagingSection::Unstaged => file_index + 1 == self.loaded_file_count(),
+            };
+
         let file_block = Container::new(Shrinkable::new(1., content.finish()).finish())
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
-            .with_margin_bottom(EDITOR_GAP)
+            // In staging mode the inter-card spacing lives inside the section border (so the
+            // border stays continuous); otherwise keep the original gap between cards.
+            .with_margin_bottom(if staging_on { 0. } else { EDITOR_GAP })
             .finish();
 
-        match section_header {
+        let inner = match section_header {
             Some(header) => Flex::column()
                 .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
                 .with_child(
@@ -5401,7 +5406,48 @@ impl CodeReviewView {
                 .with_child(file_block)
                 .finish(),
             None => file_block,
+        };
+
+        if staging_on {
+            self.wrap_section_item(inner, is_section_first, is_section_last, appearance)
+        } else {
+            inner
         }
+    }
+
+    /// Wraps a file item in its staging-section border. Each item draws left/right borders;
+    /// the first item of a section adds the rounded top, the last adds the rounded bottom.
+    /// Stacked contiguously (no inter-item margin within a section) these per-item segments
+    /// read as one continuous rounded container around the whole Staged / Changes area, with
+    /// the file cards unchanged inside it.
+    fn wrap_section_item(
+        &self,
+        inner: Box<dyn Element>,
+        is_first: bool,
+        is_last: bool,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let radius = Radius::Pixels(8.);
+        let corner = match (is_first, is_last) {
+            (true, true) => CornerRadius::with_all(radius),
+            (true, false) => CornerRadius::with_top(radius),
+            (false, true) => CornerRadius::with_bottom(radius),
+            (false, false) => CornerRadius::with_all(Radius::Pixels(0.)),
+        };
+        Container::new(inner)
+            .with_border(
+                Border::all(1.)
+                    .with_sides(is_first, true, is_last, true)
+                    .with_border_fill(theme.outline()),
+            )
+            .with_corner_radius(corner)
+            .with_horizontal_padding(6.)
+            // Spacing between file cards lives inside the border; the last card gets a small
+            // bottom inset, and only the last item carries the gap to the next section.
+            .with_padding_bottom(if is_last { 6. } else { EDITOR_GAP })
+            .with_margin_bottom(if is_last { EDITOR_GAP } else { 0. })
+            .finish()
     }
 
     /// Renders the file header with name and status
