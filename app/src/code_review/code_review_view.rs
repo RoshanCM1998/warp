@@ -97,6 +97,7 @@ use crate::code_review::diff_selector::{DiffSelector, DiffSelectorEvent, DiffTar
 use crate::code_review::diff_state::{
     DiffHunk, DiffLineType, DiffMode, DiffState, DiffStateModel, DiffStateModelEvent, DiffStats,
     FileDiff, FileDiffAndContent, FileStatusInfo, GitDiffWithBaseContent, GitFileStatus,
+    StagingSection,
 };
 use crate::code_review::editor_state::CodeReviewEditorState;
 use crate::code_review::find_model::CodeReviewFindModel;
@@ -358,6 +359,14 @@ pub enum CodeReviewAction {
     OpenCreatePrDialog,
     ViewPr(String),
     PublishBranch,
+    /// Stage a file (move it into the "Staged Changes" section). `String` is the repo-relative path.
+    StageFile(String),
+    /// Unstage a file (move it back into the "Changes" section). `String` is the repo-relative path.
+    UnstageFile(String),
+    /// Collapse/expand the "Staged Changes" section in the file sidebar.
+    ToggleStagedSectionCollapsed,
+    /// Collapse/expand the "Changes" section in the file sidebar.
+    ToggleUnstagedSectionCollapsed,
 }
 
 pub struct FileState {
@@ -371,6 +380,9 @@ pub struct FileState {
     discard_button: ViewHandle<ActionButton>,
     add_context_button: ViewHandle<ActionButton>,
     copy_path_button: ViewHandle<ActionButton>,
+    /// Stage/unstage affordance shown in the file sidebar when the staging area is enabled.
+    /// Icon/action depend on the file's `staging_section` (Plus → stage, Minus → unstage).
+    stage_unstage_button: ViewHandle<ActionButton>,
 }
 
 pub(crate) struct LoadedState {
@@ -607,6 +619,10 @@ pub struct CodeReviewView {
     file_sidebar_expanded: bool,
     /// The file sidebar state from before a code review panel is maximized.
     file_sidebar_expanded_before_maximize: Option<bool>,
+    /// Collapse state for the staging-area "Staged Changes" / "Changes" sections.
+    /// Only consulted when the staging area is enabled.
+    staged_section_collapsed: bool,
+    unstaged_section_collapsed: bool,
     scroll_state: ScrollStateHandle,
     viewported_list_state: ListState<RelocatableScrollContext>,
 
@@ -670,6 +686,45 @@ impl CodeReviewView {
 
     pub(crate) fn repo_is_local(&self) -> Option<bool> {
         self.repo_path().map(LocalOrRemotePath::is_local)
+    }
+
+    /// Map key for a file state in `LoadedState::file_states`. Staged entries get a
+    /// sentinel prefix so a partially-staged file (present in both the Staged and Changes
+    /// sections) doesn't collide with its unstaged entry. Unstaged keys are the bare
+    /// repo-relative path, preserving every existing path-keyed lookup unchanged.
+    fn file_state_key(file_diff: &FileDiff) -> String {
+        match file_diff.staging_section {
+            StagingSection::Unstaged => file_diff.file_path.clone(),
+            StagingSection::Staged => format!("\u{1}staged\u{1}{}", file_diff.file_path),
+        }
+    }
+
+    /// Whether the staging-area UI (Staged / Changes sections) is active: the feature flag
+    /// and the user setting are both on, and we're viewing local uncommitted changes (Head mode).
+    fn staging_area_enabled(&self, app: &AppContext) -> bool {
+        FeatureFlag::CodeReviewStaging.is_enabled()
+            && *CodeSettings::as_ref(app).staging_area
+            && matches!(self.diff_state_model.as_ref(app).diff_mode(app), DiffMode::Head)
+    }
+
+    /// Number of loaded file states in the Staged section (loader emits staged entries first).
+    fn staged_file_count(&self) -> usize {
+        match self.active_repo.as_ref().map(|r| &r.state) {
+            Some(CodeReviewViewState::Loaded(state)) => state
+                .file_states
+                .values()
+                .filter(|fs| matches!(fs.file_diff.staging_section, StagingSection::Staged))
+                .count(),
+            _ => 0,
+        }
+    }
+
+    /// Total number of loaded file states (staged + unstaged).
+    fn loaded_file_count(&self) -> usize {
+        match self.active_repo.as_ref().map(|r| &r.state) {
+            Some(CodeReviewViewState::Loaded(state)) => state.file_states.len(),
+            _ => 0,
+        }
     }
 
     fn to_standardized_path(&self, repo_relative_path: &str) -> Option<StandardizedPath> {
@@ -1323,6 +1378,8 @@ impl CodeReviewView {
             git_operations_menu_open: false,
             file_sidebar_expanded: false,
             file_sidebar_expanded_before_maximize: None,
+            staged_section_collapsed: false,
+            unstaged_section_collapsed: false,
             position_id_prefix: random_str,
             viewported_list_state: list_state,
             scroll_state: ScrollStateHandle::default(),
@@ -2538,7 +2595,7 @@ impl CodeReviewView {
             repo.state = CodeReviewViewState::Loaded(LoadedState {
                 file_states: file_states_vec
                     .into_iter()
-                    .map(|fs| (fs.file_diff.file_path.clone(), fs))
+                    .map(|fs| (Self::file_state_key(&fs.file_diff), fs))
                     .collect(),
                 total_additions: diff_data.total_additions,
                 total_deletions: diff_data.total_deletions,
@@ -2615,7 +2672,7 @@ impl CodeReviewView {
             let file_path = file.file_diff.file_path.clone();
             let file_line = file_line_for_open(&file.file_diff);
 
-            let chevron_path = file_path.clone();
+            let chevron_path = Self::file_state_key(&file.file_diff);
             let initial_icon = if is_expanded {
                 Icon::ChevronDown
             } else {
@@ -2693,6 +2750,28 @@ impl CodeReviewView {
                     })
             });
 
+            let staging_path = file.file_diff.file_path.clone();
+            let is_staged = matches!(file.file_diff.staging_section, StagingSection::Staged);
+            let stage_unstage_button = ctx.add_typed_action_view(move |_ctx| {
+                let (icon, tooltip) = if is_staged {
+                    (Icon::Minus, "Unstage file")
+                } else {
+                    (Icon::Plus, "Stage file")
+                };
+                ActionButton::new("", NakedTheme)
+                    .with_icon(icon)
+                    .with_size(ButtonSize::InlineActionHeader)
+                    .with_tooltip(tooltip)
+                    .on_click(move |ctx| {
+                        let action = if is_staged {
+                            CodeReviewAction::UnstageFile(staging_path.clone())
+                        } else {
+                            CodeReviewAction::StageFile(staging_path.clone())
+                        };
+                        ctx.dispatch_typed_action(action);
+                    })
+            });
+
             file_states.push(FileState {
                 file_diff: file.file_diff.clone(),
                 editor_state,
@@ -2702,6 +2781,7 @@ impl CodeReviewView {
                 discard_button,
                 add_context_button,
                 copy_path_button,
+                stage_unstage_button,
                 sidebar_mouse_state: MouseStateHandle::default(),
                 header_mouse_state: MouseStateHandle::default(),
             })
@@ -4665,6 +4745,8 @@ impl CodeReviewView {
             return self.render_no_changes_state(appearance, app);
         }
 
+        let staging_enabled = self.staging_area_enabled(app);
+
         let mut sidebar_and_diffs_row =
             Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
 
@@ -4673,7 +4755,7 @@ impl CodeReviewView {
         // When the flag is off, sidebar goes on the left (legacy).
         if !sidebar_on_right && self.file_sidebar_expanded && !state.file_states.is_empty() {
             sidebar_and_diffs_row
-                .add_child(Container::new(self.render_file_sidebar(state, appearance)).finish());
+                .add_child(Container::new(self.render_file_sidebar(state, appearance, staging_enabled)).finish());
 
             let vertical_separator = ConstrainedBox::new(
                 Rect::new()
@@ -4730,7 +4812,7 @@ impl CodeReviewView {
 
             sidebar_and_diffs_row.add_child(vertical_separator);
             sidebar_and_diffs_row
-                .add_child(Container::new(self.render_file_sidebar(state, appearance)).finish());
+                .add_child(Container::new(self.render_file_sidebar(state, appearance, staging_enabled)).finish());
         }
 
         Shrinkable::new(1., sidebar_and_diffs_row.finish()).finish()
@@ -4740,33 +4822,60 @@ impl CodeReviewView {
         &self,
         state: &LoadedState,
         appearance: &Appearance,
+        staging_enabled: bool,
     ) -> Box<dyn Element> {
         let mut column = Flex::column()
             .with_main_axis_alignment(MainAxisAlignment::Start)
             .with_cross_axis_alignment(CrossAxisAlignment::Start);
 
-        for (file_index, file_state) in state.file_states.values().enumerate() {
-            let file_row = self.render_file_sidebar_row(file_state, appearance);
-            column.add_child(
-                Hoverable::new(file_state.sidebar_mouse_state.clone(), |mouse_state| {
-                    let mut container = Container::new(Shrinkable::new(1., file_row).finish())
-                        .with_vertical_padding(5.)
-                        .with_horizontal_padding(8.)
-                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)));
+        if staging_enabled {
+            // VS Code-style two-section view. Iterate once so each row keeps its global
+            // index (used by `FileSelected` and the viewported diff list). The loader emits
+            // staged entries before unstaged, so order is preserved within each group.
+            let mut staged = Vec::new();
+            let mut unstaged = Vec::new();
+            for (index, file_state) in state.file_states.values().enumerate() {
+                match file_state.file_diff.staging_section {
+                    StagingSection::Staged => staged.push((index, file_state)),
+                    StagingSection::Unstaged => unstaged.push((index, file_state)),
+                }
+            }
 
-                    if mouse_state.is_hovered() {
-                        container = container.with_background(warp_core::ui::theme::Fill::Solid(
-                            internal_colors::neutral_3(appearance.theme()),
-                        ))
-                    }
-                    container.finish()
-                })
-                .on_click(move |ctx, _, _| {
-                    ctx.dispatch_typed_action(CodeReviewAction::FileSelected(file_index));
-                })
-                .with_cursor(Cursor::PointingHand)
-                .finish(),
-            );
+            column.add_child(self.render_staging_section_header(
+                "Staged Changes",
+                staged.len(),
+                self.staged_section_collapsed,
+                CodeReviewAction::ToggleStagedSectionCollapsed,
+                appearance,
+            ));
+            if !self.staged_section_collapsed {
+                for (index, file_state) in staged {
+                    column.add_child(
+                        self.render_sidebar_file_entry(index, file_state, appearance, true),
+                    );
+                }
+            }
+
+            column.add_child(self.render_staging_section_header(
+                "Changes",
+                unstaged.len(),
+                self.unstaged_section_collapsed,
+                CodeReviewAction::ToggleUnstagedSectionCollapsed,
+                appearance,
+            ));
+            if !self.unstaged_section_collapsed {
+                for (index, file_state) in unstaged {
+                    column.add_child(
+                        self.render_sidebar_file_entry(index, file_state, appearance, true),
+                    );
+                }
+            }
+        } else {
+            for (file_index, file_state) in state.file_states.values().enumerate() {
+                column.add_child(
+                    self.render_sidebar_file_entry(file_index, file_state, appearance, false),
+                );
+            }
         }
 
         let scrollable_content = NewScrollable::vertical(
@@ -4812,10 +4921,98 @@ impl CodeReviewView {
         (FILE_SIDEBAR_MIN_WIDTH, FILE_SIDEBAR_MAX_WIDTH)
     }
 
+    /// Wraps a single sidebar file row in the hoverable, click-to-select container.
+    /// `file_index` is the global index into `file_states` (used by `FileSelected`).
+    fn render_sidebar_file_entry(
+        &self,
+        file_index: usize,
+        file_state: &FileState,
+        appearance: &Appearance,
+        show_staging_button: bool,
+    ) -> Box<dyn Element> {
+        let file_row = self.render_file_sidebar_row(file_state, appearance, show_staging_button);
+        Hoverable::new(file_state.sidebar_mouse_state.clone(), |mouse_state| {
+            let mut container = Container::new(Shrinkable::new(1., file_row).finish())
+                .with_vertical_padding(5.)
+                .with_horizontal_padding(8.)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)));
+
+            if mouse_state.is_hovered() {
+                container = container.with_background(warp_core::ui::theme::Fill::Solid(
+                    internal_colors::neutral_3(appearance.theme()),
+                ))
+            }
+            container.finish()
+        })
+        .on_click(move |ctx, _, _| {
+            ctx.dispatch_typed_action(CodeReviewAction::FileSelected(file_index));
+        })
+        .with_cursor(Cursor::PointingHand)
+        .finish()
+    }
+
+    /// Renders a collapsible staging-area section header ("Staged Changes (N)" / "Changes (N)").
+    /// Clicking the header dispatches `toggle_action` to collapse/expand the section.
+    fn render_staging_section_header(
+        &self,
+        label: &str,
+        count: usize,
+        collapsed: bool,
+        toggle_action: CodeReviewAction,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let chevron = if collapsed {
+            Icon::ChevronRight
+        } else {
+            Icon::ChevronDown
+        };
+        let icon_color = theme.sub_text_color(theme.surface_2());
+
+        let mut row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+        row.add_child(
+            Container::new(
+                ConstrainedBox::new(
+                    chevron
+                        .to_warpui_icon(warp_core::ui::theme::Fill::Solid(icon_color.into()))
+                        .finish(),
+                )
+                .with_width(14.)
+                .with_height(14.)
+                .finish(),
+            )
+            .with_margin_right(4.)
+            .finish(),
+        );
+        row.add_child(
+            Text::new(
+                format!("{label} ({count})"),
+                appearance.ui_font_family(),
+                appearance.ui_font_size(),
+            )
+            .with_color(theme.main_text_color(theme.surface_2()).into())
+            .soft_wrap(false)
+            .finish(),
+        );
+
+        Hoverable::new(MouseStateHandle::default(), |_mouse_state| {
+            Container::new(row.finish())
+                .with_vertical_padding(6.)
+                .with_horizontal_padding(8.)
+                .finish()
+        })
+        .on_click(move |ctx, _, _| {
+            ctx.dispatch_typed_action(toggle_action.clone());
+        })
+        .with_cursor(Cursor::PointingHand)
+        .finish()
+    }
+
     fn render_file_sidebar_row(
         &self,
         file_state: &FileState,
         appearance: &Appearance,
+        show_staging_button: bool,
     ) -> Box<dyn Element> {
         let repo_relative_path = Path::new(&file_state.file_diff.file_path);
         let file_name = repo_relative_path
@@ -4951,6 +5148,14 @@ impl CodeReviewView {
             );
         }
 
+        if show_staging_button {
+            file_row.add_child(
+                Container::new(ChildView::new(&file_state.stage_unstage_button).finish())
+                    .with_margin_left(6.)
+                    .finish(),
+            );
+        }
+
         file_row.finish()
     }
 
@@ -4974,6 +5179,25 @@ impl CodeReviewView {
         appearance: &Appearance,
         app: &AppContext,
     ) -> Box<dyn Element> {
+        // Staging area: prepend a "Staged Changes (N)" / "Changes (N)" divider at each
+        // section boundary. The loader emits staged file states first, so the first staged
+        // file is index 0 and the first unstaged file is at index == staged_count.
+        let section_divider = if self.staging_area_enabled(app) {
+            let staged_count = self.staged_file_count();
+            match file.file_diff.staging_section {
+                StagingSection::Staged if file_index == 0 => {
+                    Some(self.render_main_section_divider("Staged Changes", staged_count, appearance))
+                }
+                StagingSection::Unstaged if file_index == staged_count => {
+                    let unstaged_count = self.loaded_file_count().saturating_sub(staged_count);
+                    Some(self.render_main_section_divider("Changes", unstaged_count, appearance))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         let is_item_being_scrolled = file_index == scroll_offset_from_top.list_item_index();
         // This helps us avoid rendering the sticky header for the first time when scrolled to the very top.
         let is_first_item_with_no_scroll = file_index == 0
@@ -5042,10 +5266,44 @@ impl CodeReviewView {
             content.add_child(stack.finish());
         }
 
-        Container::new(Shrinkable::new(1., content.finish()).finish())
+        let file_block = Container::new(Shrinkable::new(1., content.finish()).finish())
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
             .with_margin_bottom(EDITOR_GAP)
-            .finish()
+            .finish();
+
+        match section_divider {
+            Some(divider) => Flex::column()
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_child(divider)
+                .with_child(file_block)
+                .finish(),
+            None => file_block,
+        }
+    }
+
+    /// Renders a staging-area section divider ("Staged Changes (N)" / "Changes (N)") shown
+    /// above the first file of each section in the main code-review diff list.
+    fn render_main_section_divider(
+        &self,
+        label: &str,
+        count: usize,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        Container::new(
+            Text::new(
+                format!("{}  ({count})", label.to_uppercase()),
+                appearance.ui_font_family(),
+                appearance.ui_font_size(),
+            )
+            .with_color(theme.sub_text_color(theme.surface_2()).into())
+            .soft_wrap(false)
+            .finish(),
+        )
+        .with_vertical_padding(6.)
+        .with_horizontal_padding(4.)
+        .with_margin_bottom(4.)
+        .finish()
     }
 
     /// Renders the file header with name and status
@@ -5168,6 +5426,20 @@ impl CodeReviewView {
             .with_main_axis_alignment(MainAxisAlignment::End)
             .with_cross_axis_alignment(CrossAxisAlignment::Center);
 
+        // Stage/unstage affordance (Plus → stage, Minus → unstage) when the staging area is on.
+        if self.staging_area_enabled(app) {
+            right_row.add_child(
+                EventHandler::new(
+                    Container::new(ChildView::new(&file.stage_unstage_button).finish())
+                        .with_margin_left(4.)
+                        .finish(),
+                )
+                .on_left_mouse_up(|_, _, _| DispatchEventResult::StopPropagation)
+                .on_left_mouse_down(|_, _, _| DispatchEventResult::StopPropagation)
+                .finish(),
+            );
+        }
+
         // Add file diff as context button (before remove button)
         if FeatureFlag::DiffSetAsContext.is_enabled() {
             right_row.add_child(
@@ -5208,7 +5480,7 @@ impl CodeReviewView {
 
         let right_section = right_row.finish();
 
-        let file_path_for_toggle = file.file_diff.file_path.clone();
+        let file_path_for_toggle = Self::file_state_key(&file.file_diff);
 
         let outer_bg = theme.background();
         let inner_corner_radius = if file.is_expanded {
@@ -7840,6 +8112,30 @@ impl TypedActionView for CodeReviewView {
                 self.git_operations_chevron.update(ctx, |button, ctx| {
                     button.set_active(self.git_operations_menu_open, ctx);
                 });
+                ctx.notify();
+            }
+            CodeReviewAction::StageFile(path) => {
+                if let Some(std_path) = self.to_standardized_path(path) {
+                    let info = self.create_file_status_info(std_path);
+                    self.diff_state_model.update(ctx, |model, ctx| {
+                        model.stage_files(vec![info], ctx);
+                    });
+                }
+            }
+            CodeReviewAction::UnstageFile(path) => {
+                if let Some(std_path) = self.to_standardized_path(path) {
+                    let info = self.create_file_status_info(std_path);
+                    self.diff_state_model.update(ctx, |model, ctx| {
+                        model.unstage_files(vec![info], ctx);
+                    });
+                }
+            }
+            CodeReviewAction::ToggleStagedSectionCollapsed => {
+                self.staged_section_collapsed = !self.staged_section_collapsed;
+                ctx.notify();
+            }
+            CodeReviewAction::ToggleUnstagedSectionCollapsed => {
+                self.unstaged_section_collapsed = !self.unstaged_section_collapsed;
                 ctx.notify();
             }
         }

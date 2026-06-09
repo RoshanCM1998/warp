@@ -61,6 +61,7 @@ use super::{
     BackendOrigin, DiffHunk, DiffLine, DiffLineType, DiffMetadata, DiffMetadataAgainstBase,
     DiffMode, DiffState, DiffStateError, DiffStateModelEvent, DiffStats, FileDiff,
     FileDiffAndContent, FileStatusInfo, GitDiffData, GitDiffWithBaseContent, GitFileStatus,
+    StagingSection,
 };
 
 // Unicode bidirectional characters that should be flagged
@@ -550,10 +551,22 @@ impl LocalDiffStateModel {
             .root_dir()
             .to_local_path_lossy();
         let mode = self.mode.clone();
+        // The staging area splits Head-mode diffs into staged (index vs HEAD) and unstaged
+        // (worktree vs index) sections. Gated by both the feature flag and the user setting;
+        // when off, the loader keeps the existing single `git diff HEAD` behavior.
+        let staging_enabled = matches!(mode, DiffMode::Head)
+            && FeatureFlag::CodeReviewStaging.is_enabled()
+            && *crate::settings::CodeSettings::as_ref(ctx).staging_area;
         self.state = InternalDiffState::Loading;
         self.computing_diffs_abort_handle = Some(ctx.spawn(
             async move {
-                Self::load_diffs_for_repo(current_repository_path, mode, should_fetch_base).await
+                Self::load_diffs_for_repo(
+                    current_repository_path,
+                    mode,
+                    should_fetch_base,
+                    staging_enabled,
+                )
+                .await
             },
             Self::handle_updated_state_for_repo,
         ));
@@ -875,6 +888,137 @@ impl LocalDiffStateModel {
         _ctx: &mut ModelContext<Self>,
     ) {
         // Noop on WASM builds.
+    }
+
+    /// Stage one or more files (`git add`). Index-only changes don't touch the worktree,
+    /// so the file watcher won't fire — we reload diffs/metadata explicitly on success
+    /// (mirrors [`Self::discard_files`]).
+    #[cfg(feature = "local_fs")]
+    pub fn stage_files(&mut self, file_infos: Vec<FileStatusInfo>, ctx: &mut ModelContext<Self>) {
+        let Some(current_repository) = &self.repository else {
+            return;
+        };
+        let repo_sp = current_repository.as_ref(ctx).root_dir().clone();
+        ctx.spawn(
+            async move { Self::stage_files_impl(&repo_sp, file_infos).await },
+            |me, result, ctx| match result {
+                Ok(_) => {
+                    me.load_diffs_for_current_repo(false, false, ctx);
+                    me.refresh_diff_metadata_for_current_repo(false, ctx);
+                }
+                Err(err) => {
+                    log::error!("Failed to stage files: {err}");
+                }
+            },
+        );
+    }
+
+    #[cfg(not(feature = "local_fs"))]
+    pub fn stage_files(&mut self, _file_infos: Vec<FileStatusInfo>, _ctx: &mut ModelContext<Self>) {
+        // Noop on WASM builds.
+    }
+
+    /// Unstage one or more files (`git restore --staged`, falling back to `git rm --cached`
+    /// for repos without a HEAD commit). Reloads diffs/metadata explicitly on success.
+    #[cfg(feature = "local_fs")]
+    pub fn unstage_files(&mut self, file_infos: Vec<FileStatusInfo>, ctx: &mut ModelContext<Self>) {
+        let Some(current_repository) = &self.repository else {
+            return;
+        };
+        let repo_sp = current_repository.as_ref(ctx).root_dir().clone();
+        ctx.spawn(
+            async move { Self::unstage_files_impl(&repo_sp, file_infos).await },
+            |me, result, ctx| match result {
+                Ok(_) => {
+                    me.load_diffs_for_current_repo(false, false, ctx);
+                    me.refresh_diff_metadata_for_current_repo(false, ctx);
+                }
+                Err(err) => {
+                    log::error!("Failed to unstage files: {err}");
+                }
+            },
+        );
+    }
+
+    #[cfg(not(feature = "local_fs"))]
+    pub fn unstage_files(
+        &mut self,
+        _file_infos: Vec<FileStatusInfo>,
+        _ctx: &mut ModelContext<Self>,
+    ) {
+        // Noop on WASM builds.
+    }
+
+    /// Collects repo-relative paths for staging operations. Staged renames include the
+    /// old path so the rename is staged/unstaged as a unit.
+    #[cfg(feature = "local_fs")]
+    fn staging_relative_paths(
+        repo_sp: &StandardizedPath,
+        file_infos: &[FileStatusInfo],
+    ) -> Vec<String> {
+        let mut paths = Vec::new();
+        for info in file_infos {
+            if let GitFileStatus::Renamed { old_path } = &info.status {
+                if !old_path.is_empty() {
+                    paths.push(old_path.clone());
+                }
+            }
+            let relative = info
+                .path
+                .strip_prefix(repo_sp)
+                .unwrap_or(info.path.as_str())
+                .to_string();
+            paths.push(relative);
+        }
+        paths
+    }
+
+    #[cfg(feature = "local_fs")]
+    async fn stage_files_impl(
+        repo_sp: &StandardizedPath,
+        file_infos: Vec<FileStatusInfo>,
+    ) -> Result<()> {
+        let Some(repo_path) = repo_sp.to_local_path() else {
+            anyhow::bail!("stage_files_impl called with non-local path: {repo_sp}");
+        };
+        let paths = Self::staging_relative_paths(repo_sp, &file_infos);
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut args: Vec<&str> = vec!["add", "--"];
+        args.extend(paths.iter().map(String::as_str));
+        log::debug!("[GIT OPERATION] local.rs stage_files_impl git {}", args.join(" "));
+        run_git_command(&repo_path, &args).await?;
+        Ok(())
+    }
+
+    #[cfg(feature = "local_fs")]
+    async fn unstage_files_impl(
+        repo_sp: &StandardizedPath,
+        file_infos: Vec<FileStatusInfo>,
+    ) -> Result<()> {
+        let Some(repo_path) = repo_sp.to_local_path() else {
+            anyhow::bail!("unstage_files_impl called with non-local path: {repo_sp}");
+        };
+        let paths = Self::staging_relative_paths(repo_sp, &file_infos);
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut args: Vec<&str> = vec!["restore", "--staged", "--"];
+        args.extend(paths.iter().map(String::as_str));
+        log::debug!(
+            "[GIT OPERATION] local.rs unstage_files_impl git {}",
+            args.join(" ")
+        );
+        if let Err(err) = run_git_command(&repo_path, &args).await {
+            // `git restore --staged` needs a HEAD; for a repo with no commits yet, the only
+            // staged changes are additions, which are unstaged with `git rm --cached`.
+            log::warn!("git restore --staged failed ({err}); falling back to git rm --cached");
+            let mut reset_args: Vec<&str> = vec!["rm", "--cached", "-r", "--"];
+            reset_args.extend(paths.iter().map(String::as_str));
+            run_git_command(&repo_path, &reset_args).await?;
+        }
+        Ok(())
     }
 
     /// Sets whether the code review pane needs diff metadata.
@@ -1362,7 +1506,9 @@ impl LocalDiffStateModel {
         mode: DiffMode,
         repo_path: PathBuf,
     ) -> Option<GitDiffData> {
-        let diffs = Self::load_diffs_for_repo(repo_path, mode, false).await;
+        // Staging-area splitting is a model-driven, setting-gated behavior; standalone
+        // snapshot loads keep the single-list view.
+        let diffs = Self::load_diffs_for_repo(repo_path, mode, false, false).await;
         diffs.changes.ok().map(|diff| diff.into())
     }
 
@@ -1375,7 +1521,7 @@ impl LocalDiffStateModel {
         mode: DiffMode,
         repo_path: PathBuf,
     ) -> Option<GitDiffWithBaseContent> {
-        let diffs = Self::load_diffs_for_repo(repo_path, mode, false).await;
+        let diffs = Self::load_diffs_for_repo(repo_path, mode, false, false).await;
         diffs.changes.ok()
     }
 
@@ -1383,8 +1529,12 @@ impl LocalDiffStateModel {
         repo_path: PathBuf,
         mode: DiffMode,
         should_fetch_base: bool,
+        staging_enabled: bool,
     ) -> DiffsWithBaseContent {
         let diffs = match mode {
+            DiffMode::Head if staging_enabled => {
+                Self::diff_state_against_head_split(&repo_path).await
+            }
             DiffMode::Head => Self::diff_state_against_head(&repo_path).await,
             DiffMode::MainBranch => {
                 Self::diff_state_against_base_branch(&repo_path, should_fetch_base).await
@@ -1594,6 +1744,304 @@ impl LocalDiffStateModel {
             total_additions,
             total_deletions,
         })
+    }
+
+    /// Head-mode diff split into staged (index vs HEAD) and unstaged (worktree vs index)
+    /// sections for the staging area. A partially-staged file produces two `FileDiff`
+    /// entries, one tagged `Staged` and one `Unstaged`. Only used when the staging area
+    /// is enabled; otherwise [`Self::diff_state_against_head`] keeps the single-list behavior.
+    async fn diff_state_against_head_split(repo_path: &Path) -> Result<GitDiffWithBaseContent> {
+        log::debug!(
+            "[GIT OPERATION] local.rs diff_state_against_head_split git --no-optional-locks status --untracked-files=all --branch --porcelain=2 -z"
+        );
+        let status_output = run_git_command(
+            repo_path,
+            &[
+                "--no-optional-locks",
+                "status",
+                "--untracked-files=all",
+                "--branch",
+                "--porcelain=2",
+                "-z",
+            ],
+        )
+        .await?;
+
+        let (staged, unstaged) = Self::parse_git_status_split(&status_output)?;
+        let binary_files = Self::get_binary_files(repo_path).await?;
+
+        let mut files = Vec::new();
+        let mut total_additions = 0;
+        let mut total_deletions = 0;
+
+        for (section, entries) in [
+            (StagingSection::Staged, staged),
+            (StagingSection::Unstaged, unstaged),
+        ] {
+            for (file_path, status) in entries {
+                let is_binary = binary_files.contains(&file_path);
+                let mut file_diff = Self::get_file_diff_for_section(
+                    repo_path, &file_path, &status, is_binary, section,
+                )
+                .await?;
+                let content =
+                    Self::get_file_content_for_section(repo_path, &file_path, &status, section)
+                        .await;
+
+                file_diff.is_autogenerated =
+                    is_file_autogenerated(&file_path, content.as_deref());
+
+                total_additions += file_diff.additions();
+                total_deletions += file_diff.deletions();
+
+                files.push(FileDiffAndContent {
+                    file_diff,
+                    content_at_head: content,
+                });
+            }
+        }
+
+        Ok(GitDiffWithBaseContent {
+            files_changed: files.len(),
+            files,
+            total_additions,
+            total_deletions,
+        })
+    }
+
+    /// Maps a single porcelain-2 `XY` position character to a [`GitFileStatus`].
+    /// Returns `None` for `.` (unmodified in that position). `old_path` is only
+    /// meaningful for rename/copy entries (the index `X` position).
+    fn status_from_xy_char(c: char, old_path: Option<String>) -> Option<GitFileStatus> {
+        match c {
+            '.' => None,
+            'M' | 'T' => Some(GitFileStatus::Modified),
+            'A' => Some(GitFileStatus::New),
+            'D' => Some(GitFileStatus::Deleted),
+            'R' => Some(GitFileStatus::Renamed {
+                old_path: old_path.unwrap_or_default(),
+            }),
+            'C' => Some(GitFileStatus::Copied {
+                old_path: old_path.unwrap_or_default(),
+            }),
+            'U' => Some(GitFileStatus::Conflicted),
+            _ => Some(GitFileStatus::Modified),
+        }
+    }
+
+    /// Parses `git status --porcelain=2 -z` into (staged, unstaged) file lists, retaining
+    /// the porcelain `XY` split (`X` = index/staged, `Y` = worktree/unstaged) that
+    /// [`Self::parse_git_status`] collapses. Untracked and unmerged entries are unstaged.
+    fn parse_git_status_split(
+        status_output: &str,
+    ) -> Result<(Vec<(String, GitFileStatus)>, Vec<(String, GitFileStatus)>)> {
+        let mut staged = Vec::new();
+        let mut unstaged = Vec::new();
+        if status_output.is_empty() {
+            return Ok((staged, unstaged));
+        }
+
+        let tokens: Vec<&str> = status_output.split('\0').collect();
+        let mut i = 0;
+        while i < tokens.len() {
+            let token = tokens[i];
+            if token.is_empty() || token.starts_with("# ") {
+                i += 1;
+                continue;
+            }
+
+            match token.chars().next().unwrap_or('?') {
+                '1' => {
+                    let parts: Vec<&str> = token.splitn(9, ' ').collect();
+                    if parts.len() >= 9 {
+                        let code = parts[1];
+                        let path = parts[8];
+                        let mut code_chars = code.chars();
+                        let x = code_chars.next().unwrap_or('.');
+                        let y = code_chars.next().unwrap_or('.');
+                        if let Some(s) = Self::status_from_xy_char(x, None) {
+                            staged.push((path.to_string(), s));
+                        }
+                        if let Some(s) = Self::status_from_xy_char(y, None) {
+                            unstaged.push((path.to_string(), s));
+                        }
+                    }
+                }
+                '2' => {
+                    let parts: Vec<&str> = token.splitn(10, ' ').collect();
+                    if parts.len() >= 10 {
+                        let code = parts[1];
+                        let path = parts[9];
+                        let old_path = if i + 1 < tokens.len() {
+                            tokens[i + 1].to_string()
+                        } else {
+                            String::new()
+                        };
+                        let mut code_chars = code.chars();
+                        let x = code_chars.next().unwrap_or('.');
+                        let y = code_chars.next().unwrap_or('.');
+                        // The rename/copy is an index (staged) operation; the old path
+                        // belongs to the staged entry. A worktree change (Y) applies to
+                        // the new path as a plain modification.
+                        if let Some(s) = Self::status_from_xy_char(x, Some(old_path)) {
+                            staged.push((path.to_string(), s));
+                        }
+                        if let Some(s) = Self::status_from_xy_char(y, None) {
+                            unstaged.push((path.to_string(), s));
+                        }
+                        i += 1; // Skip the old path token
+                    }
+                }
+                'u' => {
+                    let parts: Vec<&str> = token.splitn(11, ' ').collect();
+                    if parts.len() >= 11 {
+                        unstaged.push((parts[10].to_string(), GitFileStatus::Conflicted));
+                    }
+                }
+                '?' => {
+                    if token.len() > 2 {
+                        unstaged.push((token[2..].to_string(), GitFileStatus::Untracked));
+                    }
+                }
+                _ => {}
+            }
+
+            i += 1;
+        }
+
+        Ok((staged, unstaged))
+    }
+
+    /// Diffs a single file for a specific staging section: `Staged` compares the index
+    /// against HEAD (`git diff --cached`), `Unstaged` compares the worktree against the
+    /// index (`git diff`). Mirrors [`Self::get_file_diff`] but with section-aware bases.
+    async fn get_file_diff_for_section(
+        repo_path: &Path,
+        file_path: &str,
+        status: &GitFileStatus,
+        is_binary: bool,
+        section: StagingSection,
+    ) -> Result<FileDiff> {
+        if is_binary {
+            return Ok(FileDiff {
+                file_path: file_path.to_owned(),
+                status: status.clone(),
+                hunks: Arc::new(Vec::new()),
+                is_binary: true,
+                is_autogenerated: false,
+                max_line_number: 0,
+                has_hidden_bidi_chars: false,
+                size: DiffSize::Normal,
+                staging_section: section,
+            });
+        }
+
+        let cached = matches!(section, StagingSection::Staged);
+        let mut diff_args: Vec<&str> =
+            vec!["diff", "--no-ext-diff", "--patch-with-raw", "-z", "--no-color"];
+        if cached {
+            diff_args.push("--cached");
+        }
+        match status {
+            // Untracked files only ever appear in the unstaged section; compare to empty.
+            GitFileStatus::Untracked if !cached => {
+                diff_args.extend(["--no-index", "--", "/dev/null", file_path]);
+            }
+            GitFileStatus::Renamed { old_path } => {
+                diff_args.extend(["--", old_path.as_str(), file_path]);
+            }
+            _ => {
+                diff_args.extend(["--", file_path]);
+            }
+        }
+
+        log::debug!(
+            "[GIT OPERATION] local.rs get_file_diff_for_section git {}",
+            diff_args.join(" ")
+        );
+        let diff_output = match run_git_command(repo_path, &diff_args).await {
+            Ok(output) => output,
+            Err(error) => {
+                log::info!("Failed to get {section:?} file diff for {file_path}: {error}");
+                return Ok(FileDiff {
+                    file_path: file_path.to_owned(),
+                    status: status.clone(),
+                    hunks: Arc::new(Vec::new()),
+                    is_binary: true,
+                    is_autogenerated: false,
+                    max_line_number: 0,
+                    has_hidden_bidi_chars: false,
+                    size: DiffSize::Normal,
+                    staging_section: section,
+                });
+            }
+        };
+
+        if diff_output
+            .lines()
+            .any(|line| line.starts_with("Binary files ") && line.contains(" differ"))
+        {
+            return Ok(FileDiff {
+                file_path: file_path.to_owned(),
+                status: status.clone(),
+                hunks: Arc::new(Vec::new()),
+                is_binary: true,
+                is_autogenerated: false,
+                max_line_number: 0,
+                has_hidden_bidi_chars: false,
+                size: DiffSize::Normal,
+                staging_section: section,
+            });
+        }
+
+        let hunks = Self::parse_diff_hunks(&diff_output)?;
+        let mut max_line_number = 0;
+        for hunk in &hunks {
+            for line in &hunk.lines {
+                if let Some(line_num) = line.old_line_number {
+                    max_line_number = max_line_number.max(line_num);
+                }
+                if let Some(line_num) = line.new_line_number {
+                    max_line_number = max_line_number.max(line_num);
+                }
+            }
+        }
+
+        let has_hidden_bidi_chars = Self::check_for_hidden_bidi_chars(&diff_output);
+        let size = compute_diff_size(&hunks, diff_output.len());
+
+        Ok(FileDiff {
+            file_path: file_path.to_owned(),
+            status: status.clone(),
+            hunks: Arc::new(hunks),
+            is_binary,
+            is_autogenerated: false,
+            max_line_number,
+            has_hidden_bidi_chars,
+            size,
+            staging_section: section,
+        })
+    }
+
+    /// Base content for a section's diff: HEAD for staged (index vs HEAD), the index
+    /// blob (`git show :path`) for unstaged (worktree vs index).
+    async fn get_file_content_for_section(
+        repo_path: &Path,
+        file_path: &str,
+        status: &GitFileStatus,
+        section: StagingSection,
+    ) -> Option<String> {
+        match section {
+            StagingSection::Staged => {
+                Self::get_file_content_at_head(repo_path, file_path, status).await
+            }
+            StagingSection::Unstaged => match status {
+                GitFileStatus::Untracked | GitFileStatus::New => Some(String::new()),
+                _ => run_git_command(repo_path, &["show", &format!(":{file_path}")])
+                    .await
+                    .ok(),
+            },
+        }
     }
 
     async fn diff_state_against_base_branch(
@@ -2138,6 +2586,7 @@ impl LocalDiffStateModel {
                 max_line_number: 0,
                 has_hidden_bidi_chars: false,
                 size: DiffSize::Normal,
+                staging_section: StagingSection::Unstaged,
             });
         }
 
@@ -2254,6 +2703,7 @@ impl LocalDiffStateModel {
                     max_line_number: 0,
                     has_hidden_bidi_chars: false,
                     size: DiffSize::Normal,
+                    staging_section: StagingSection::Unstaged,
                 });
             }
         };
@@ -2273,6 +2723,7 @@ impl LocalDiffStateModel {
                 max_line_number: 0,
                 has_hidden_bidi_chars: false,
                 size: DiffSize::Normal,
+                staging_section: StagingSection::Unstaged,
             });
         }
 
@@ -2304,6 +2755,7 @@ impl LocalDiffStateModel {
             max_line_number,
             has_hidden_bidi_chars,
             size,
+            staging_section: StagingSection::Unstaged,
         })
     }
 

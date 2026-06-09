@@ -9,7 +9,7 @@ use crate::code_review::diff_size_limits::DiffSize;
 use crate::code_review::diff_state::{
     DiffHunk, DiffLine, DiffLineType, DiffMetadata, DiffMetadataAgainstBase, DiffMode, DiffState,
     DiffStateModelEvent, DiffStats, FileDiff, FileDiffAndContent, GitDiffData,
-    GitDiffWithBaseContent, GitFileStatus, RemoteDiffStateModel,
+    GitDiffWithBaseContent, GitFileStatus, RemoteDiffStateModel, StagingSection,
 };
 use crate::server::telemetry::context_provider::AppTelemetryContextProvider;
 use crate::util::git::{Commit, PrInfo};
@@ -100,6 +100,7 @@ fn simple_file_with_content(path: &str, content_at_base: Option<&str>) -> FileDi
             max_line_number: 10,
             has_hidden_bidi_chars: false,
             size: DiffSize::Normal,
+            staging_section: StagingSection::Unstaged,
         },
         content_at_head: content_at_base.map(str::to_string),
     }
@@ -644,6 +645,7 @@ fn apply_file_delta_none_removes_file() {
                 max_line_number: 0,
                 has_hidden_bidi_chars: false,
                 size: DiffSize::Normal,
+                staging_section: StagingSection::Unstaged,
             }],
             total_additions: 0,
             total_deletions: 0,

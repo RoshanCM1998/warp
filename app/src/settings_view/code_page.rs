@@ -394,6 +394,9 @@ impl CodeSettingsPageView {
                 Box::new(GlobalSearchToggleWidget::default()),
                 Box::new(FormatOnSaveToggleWidget::default()),
             ]);
+            if FeatureFlag::CodeReviewStaging.is_enabled() {
+                code_editor_review_widgets.push(Box::new(StagingAreaToggleWidget::default()));
+            }
             let categories = vec![
                 Category::new("Codebase Indexing", codebase_indexing_widgets),
                 Category::new("Code Editor and Review", code_editor_review_widgets),
@@ -500,6 +503,9 @@ impl CodeSettingsPageView {
                             Box::new(GlobalSearchToggleWidget::default()),
                             Box::new(FormatOnSaveToggleWidget::default()),
                         ]);
+                        if FeatureFlag::CodeReviewStaging.is_enabled() {
+                            widgets.push(Box::new(StagingAreaToggleWidget::default()));
+                        }
                     }
                 }
                 // Subpage widgets render their own subheader-sized titles,
@@ -551,6 +557,9 @@ impl CodeSettingsPageView {
                 Box::new(GlobalSearchToggleWidget::default()),
                 Box::new(FormatOnSaveToggleWidget::default()),
             ]);
+            if FeatureFlag::CodeReviewStaging.is_enabled() {
+                code_editor_review_widgets.push(Box::new(StagingAreaToggleWidget::default()));
+            }
             let categories = vec![
                 Category::new("Codebase Indexing", codebase_indexing_widgets),
                 Category::new("Code Editor and Review", code_editor_review_widgets),
@@ -671,6 +680,7 @@ pub enum CodeSettingsPageAction {
     ToggleProjectExplorer,
     ToggleGlobalSearch,
     ToggleFormatOnSave,
+    ToggleStagingArea,
     /// Install (if needed) and enable a suggested LSP server.
     InstallAndEnableLspServer {
         workspace_path: PathBuf,
@@ -874,6 +884,12 @@ impl TypedActionView for CodeSettingsPageView {
             CodeSettingsPageAction::ToggleFormatOnSave => {
                 CodeSettings::handle(ctx).update(ctx, |settings, ctx| {
                     report_if_error!(settings.format_on_save.toggle_and_save_value(ctx));
+                });
+                ctx.notify();
+            }
+            CodeSettingsPageAction::ToggleStagingArea => {
+                CodeSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings.staging_area.toggle_and_save_value(ctx));
                 });
                 ctx.notify();
             }
@@ -2989,6 +3005,49 @@ impl SettingsWidget for FormatOnSaveToggleWidget {
                 .finish(),
             Some(
                 "Automatically format the file with the language server on save. Other LSP features (hover, go-to-definition, references, diagnostics) are unaffected."
+                    .into(),
+            ),
+        )
+    }
+}
+
+#[derive(Default)]
+struct StagingAreaToggleWidget {
+    switch_state: SwitchStateHandle,
+}
+
+impl SettingsWidget for StagingAreaToggleWidget {
+    type View = CodeSettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "staging area git stage unstage staged changes code review index"
+    }
+
+    fn render(
+        &self,
+        _view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let code_settings = CodeSettings::as_ref(app);
+
+        render_body_item::<CodeSettingsPageAction>(
+            "Staging area".into(),
+            None,
+            LocalOnlyIconState::Hidden,
+            ToggleState::Enabled,
+            appearance,
+            appearance
+                .ui_builder()
+                .switch(self.switch_state.clone())
+                .check(*code_settings.staging_area)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(CodeSettingsPageAction::ToggleStagingArea);
+                })
+                .finish(),
+            Some(
+                "Show a git staging area in Code Review with separate staged and unstaged sections. Stage files and hunks before committing."
                     .into(),
             ),
         )

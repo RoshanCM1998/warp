@@ -15,7 +15,7 @@ use crate::code_review::diff_size_limits::DiffSize;
 use crate::code_review::diff_state::{
     DiffHunk, DiffLine, DiffLineType, DiffMetadata, DiffMetadataAgainstBase, DiffMode, DiffState,
     DiffStats, FileDiff, FileDiffAndContent, FileStatusInfo, GitDiffData, GitDiffWithBaseContent,
-    GitFileStatus,
+    GitFileStatus, StagingSection,
 };
 use crate::util::git::{Commit, PrInfo};
 
@@ -248,6 +248,9 @@ impl TryFrom<&proto::FileDiff> for FileDiff {
             max_line_number: file.max_line_number as usize,
             has_hidden_bidi_chars: file.has_hidden_bidi_chars,
             size,
+            // The staging area is a local-only feature; remote-sourced diffs are always
+            // treated as a single (unstaged) list.
+            staging_section: StagingSection::Unstaged,
         })
     }
 }

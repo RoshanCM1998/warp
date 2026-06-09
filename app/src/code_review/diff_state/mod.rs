@@ -149,6 +149,17 @@ pub struct DiffHunk {
     pub unified_diff_end: usize,
 }
 
+/// Which staging-area section a [`FileDiff`] belongs to. Only meaningful when the
+/// code-review staging area is enabled (otherwise every diff is `Unstaged` by default
+/// and the view renders a single combined list). A partially-staged file produces two
+/// `FileDiff` entries: one `Staged` (index vs HEAD) and one `Unstaged` (worktree vs index).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StagingSection {
+    #[default]
+    Unstaged,
+    Staged,
+}
+
 /// Represents the diff for a single file, as rendered by `git diff`.
 /// This matches Git Desktop's FileDiff structure.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -163,6 +174,10 @@ pub struct FileDiff {
     pub max_line_number: usize,
     pub has_hidden_bidi_chars: bool,
     pub size: DiffSize,
+    /// Which staging section this diff belongs to. Defaults to `Unstaged` (and is ignored
+    /// unless the staging area is enabled). `#[serde(default)]` keeps remote payloads compatible.
+    #[serde(default)]
+    pub staging_section: StagingSection,
 }
 
 impl FileDiff {
@@ -660,6 +675,39 @@ impl DiffStateModel {
                     model.discard_files(file_infos, should_stash, branch_name, ctx);
                 });
             }
+        }
+    }
+
+    /// Stage files into the git index. Only the local backend supports staging; the
+    /// remote backend is a no-op (the staging area is a local-only, Head-mode feature).
+    pub(crate) fn stage_files(
+        &self,
+        file_infos: Vec<FileStatusInfo>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        match self {
+            Self::Local(local) => {
+                local.update(ctx, |local, ctx| {
+                    local.stage_files(file_infos, ctx);
+                });
+            }
+            Self::Remote(_) => {}
+        }
+    }
+
+    /// Unstage files from the git index. Local-only; remote backend is a no-op.
+    pub(crate) fn unstage_files(
+        &self,
+        file_infos: Vec<FileStatusInfo>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        match self {
+            Self::Local(local) => {
+                local.update(ctx, |local, ctx| {
+                    local.unstage_files(file_infos, ctx);
+                });
+            }
+            Self::Remote(_) => {}
         }
     }
 

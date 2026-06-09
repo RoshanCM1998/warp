@@ -278,3 +278,90 @@ fn test_parse_git_status_file_without_spaces_still_works() {
     assert_eq!(result[0].0, "simple.txt");
     assert_eq!(result[0].1, GitFileStatus::Modified);
 }
+
+#[test]
+fn test_parse_git_status_split_partitions_every_corner_case() {
+    // Mirrors real `git status --porcelain=2 -z --untracked-files=all --branch` output
+    // captured from a fixture repo with one of every staging corner case:
+    //   .M committed.txt  -> unstaged modify
+    //   D. deleted.txt    -> staged delete
+    //   MM partial.txt    -> staged AND unstaged (appears in both sections)
+    //   R. renamed*.txt   -> staged rename (old path is the next NUL token)
+    //   M. staged_mod.txt -> staged modify
+    //   A. staged_new.txt -> staged new
+    //   ?  new_untracked  -> unstaged untracked
+    // (`\` at line end strips the following newline + indentation, leaving clean NUL joins.)
+    let status_output = "# branch.oid abc123\0# branch.head main\0\
+         1 .M N... 100644 100644 100644 h1 h1 committed.txt\0\
+         1 D. N... 100644 000000 000000 h2 z0 deleted.txt\0\
+         1 MM N... 100644 100644 100644 h3 h3 partial.txt\0\
+         2 R. N... 100644 100644 100644 h4 h4 R100 renamed2.txt\0renamed.txt\0\
+         1 M. N... 100644 100644 100644 h5 h5 staged_mod.txt\0\
+         1 A. N... 000000 100644 100644 z0 h6 staged_new.txt\0\
+         ? new_untracked.txt";
+
+    let (staged, unstaged) =
+        LocalDiffStateModel::parse_git_status_split(status_output).unwrap();
+
+    // Staged = index changes (porcelain X != '.').
+    assert_eq!(
+        staged,
+        vec![
+            ("deleted.txt".to_string(), GitFileStatus::Deleted),
+            ("partial.txt".to_string(), GitFileStatus::Modified),
+            (
+                "renamed2.txt".to_string(),
+                GitFileStatus::Renamed {
+                    old_path: "renamed.txt".to_string()
+                }
+            ),
+            ("staged_mod.txt".to_string(), GitFileStatus::Modified),
+            ("staged_new.txt".to_string(), GitFileStatus::New),
+        ],
+        "staged section should contain exactly the index-side changes"
+    );
+
+    // Unstaged = worktree changes (porcelain Y != '.') plus untracked.
+    assert_eq!(
+        unstaged,
+        vec![
+            ("committed.txt".to_string(), GitFileStatus::Modified),
+            ("partial.txt".to_string(), GitFileStatus::Modified),
+            ("new_untracked.txt".to_string(), GitFileStatus::Untracked),
+        ],
+        "unstaged section should contain worktree changes + untracked"
+    );
+}
+
+#[test]
+fn test_parse_git_status_split_empty_is_empty() {
+    let (staged, unstaged) = LocalDiffStateModel::parse_git_status_split("").unwrap();
+    assert!(staged.is_empty());
+    assert!(unstaged.is_empty());
+}
+
+#[test]
+fn test_status_from_xy_char_mapping() {
+    use GitFileStatus::*;
+    assert_eq!(LocalDiffStateModel::status_from_xy_char('.', None), None);
+    assert_eq!(
+        LocalDiffStateModel::status_from_xy_char('M', None),
+        Some(Modified)
+    );
+    assert_eq!(
+        LocalDiffStateModel::status_from_xy_char('A', None),
+        Some(New)
+    );
+    assert_eq!(
+        LocalDiffStateModel::status_from_xy_char('D', None),
+        Some(Deleted)
+    );
+    assert_eq!(
+        LocalDiffStateModel::status_from_xy_char('T', None),
+        Some(Modified)
+    );
+    assert_eq!(
+        LocalDiffStateModel::status_from_xy_char('U', None),
+        Some(Conflicted)
+    );
+}

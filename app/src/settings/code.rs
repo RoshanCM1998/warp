@@ -90,6 +90,17 @@ define_settings_group!(CodeSettings, settings: [
         toml_path: "code.editor.diff_layout",
         description: "Layout for Code Review diff views: 'inline' or 'side_by_side'.",
     },
+    // Enables the git staging area (staged/unstaged sections) in Code Review.
+    // Off by default; only takes effect when the `code_review_staging` feature flag is enabled.
+    staging_area: StagingArea {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::DESKTOP,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        private: false,
+        toml_path: "code.review.staging_area",
+        description: "Show a git staging area with separate staged and unstaged sections in Code Review.",
+    },
     // Controls whether the language server reformats the file on save.
     format_on_save: FormatOnSave {
         type: bool,

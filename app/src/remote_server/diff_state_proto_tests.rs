@@ -6,7 +6,7 @@ use super::super::proto;
 use crate::code_review::diff_size_limits::DiffSize;
 use crate::code_review::diff_state::{
     DiffMetadata, DiffMetadataAgainstBase, DiffMode, DiffState, DiffStats, FileDiff,
-    FileDiffAndContent, FileStatusInfo, GitDiffWithBaseContent, GitFileStatus,
+    FileDiffAndContent, FileStatusInfo, GitDiffWithBaseContent, GitFileStatus, StagingSection,
 };
 use crate::util::git::PrInfo;
 
@@ -146,6 +146,7 @@ fn file_diff_to_proto_preserves_repo_relative_path() {
         max_line_number: 0,
         has_hidden_bidi_chars: false,
         size: DiffSize::Normal,
+        staging_section: StagingSection::Unstaged,
     };
 
     let proto_diff = super::file_diff_to_proto(&file_diff, None);
@@ -165,6 +166,7 @@ fn build_diff_state_snapshot_preserves_repo_relative_file_paths() {
             max_line_number: 0,
             has_hidden_bidi_chars: false,
             size: DiffSize::Normal,
+            staging_section: StagingSection::Unstaged,
         },
         content_at_head: None,
     };

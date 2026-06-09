@@ -830,6 +830,9 @@ pub enum FeatureFlag {
     /// Enables commit, push, and create-PR actions in the code review panel.
     GitOperationsInCodeReview,
 
+    /// Enables the git staging area (staged/unstaged sections) in the code review panel.
+    CodeReviewStaging,
+
     /// Gates the remote control chip and `/remote-control` slash command in the CLI agent footer.
     HOARemoteControl,
 
@@ -1067,6 +1070,9 @@ impl FeatureFlag {
             ),
             GitOperationsInCodeReview => Some(
                 "Enables commit, push, and create-PR actions directly from the code review panel.",
+            ),
+            CodeReviewStaging => Some(
+                "Enables the git staging area (staged/unstaged sections) in the code review panel.",
             ),
             _ => None,
         }

@@ -992,6 +992,8 @@ configurable_toolbar = []
 warpify_footer = []
 hoa_onboarding_flow = []
 git_operations_in_code_review = []
+# Off by default (opt-in); not added to the default feature list.
+code_review_staging = []
 hoa_remote_control = []
 codex_notifications = []
 codex_plugin = []

@@ -28,7 +28,7 @@ use crate::code_review::comments::{
     PendingImportedReviewCommentTarget,
 };
 use crate::code_review::diff_size_limits::DiffSize;
-use crate::code_review::diff_state::{DiffStateModel, FileDiff, GitFileStatus};
+use crate::code_review::diff_state::{DiffStateModel, FileDiff, GitFileStatus, StagingSection};
 use crate::code_review::editor_state::CodeReviewEditorState;
 use crate::code_review::git_status_update::GitStatusUpdateModel;
 use crate::code_review::GlobalCodeReviewModel;
@@ -311,6 +311,8 @@ fn create_loaded_state_with_editors(
             let discard_button = app.add_view(window_id, |_| ActionButton::new("", NakedTheme));
             let add_context_button = app.add_view(window_id, |_| ActionButton::new("", NakedTheme));
             let copy_path_button = app.add_view(window_id, |_| ActionButton::new("", NakedTheme));
+            let stage_unstage_button =
+                app.add_view(window_id, |_| ActionButton::new("", NakedTheme));
 
             let state = FileState {
                 file_diff: FileDiff {
@@ -322,6 +324,7 @@ fn create_loaded_state_with_editors(
                     max_line_number: 0,
                     has_hidden_bidi_chars: false,
                     size: DiffSize::Normal,
+                    staging_section: StagingSection::Unstaged,
                 },
                 editor_state: Some(CodeReviewEditorState::new_loaded(editor)),
                 is_expanded: true,
@@ -332,6 +335,7 @@ fn create_loaded_state_with_editors(
                 discard_button,
                 add_context_button,
                 copy_path_button,
+                stage_unstage_button,
             };
             (file_path, state)
         })
