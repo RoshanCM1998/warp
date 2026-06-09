@@ -260,6 +260,10 @@ const FILE_SIDEBAR_MAX_WIDTH: f32 = 800.;
 const FILE_HEADER_HEIGHT: f32 = 41.;
 /// The gap between editors in the viewported list.
 const EDITOR_GAP: f32 = 12.;
+/// Best-guess height of a staging-area section header (label row + divider). Used as a
+/// fallback for the sticky-header offset before the header has been measured. If the
+/// header styling changes substantially, update this value.
+const STAGING_SECTION_HEADER_HEIGHT: f32 = 32.;
 const FILE_SIDEBAR_PANE_WIDTH_PERCENTAGE: f32 = 0.25;
 /// Vertical gap between the right panel header row and the code review content below it
 /// (sub-header in loaded state, loading text in loading state).
@@ -623,6 +627,13 @@ pub struct CodeReviewView {
     /// Only consulted when the staging area is enabled.
     staged_section_collapsed: bool,
     unstaged_section_collapsed: bool,
+    /// Persistent mouse-state handles for the collapsible section headers. A fresh
+    /// `MouseStateHandle` per render loses the press state between mouse-down and
+    /// mouse-up, so the click never fires; these must outlive a single frame.
+    staged_header_mouse_state: MouseStateHandle,
+    unstaged_header_mouse_state: MouseStateHandle,
+    staged_sidebar_header_mouse_state: MouseStateHandle,
+    unstaged_sidebar_header_mouse_state: MouseStateHandle,
     scroll_state: ScrollStateHandle,
     viewported_list_state: ListState<RelocatableScrollContext>,
 
@@ -724,6 +735,15 @@ impl CodeReviewView {
         match self.active_repo.as_ref().map(|r| &r.state) {
             Some(CodeReviewViewState::Loaded(state)) => state.file_states.len(),
             _ => 0,
+        }
+    }
+
+    /// Invalidates cached heights for every file diff in the viewported list. Used when a
+    /// staging section is collapsed/expanded, since the affected files change height.
+    fn invalidate_all_file_heights(&self) {
+        for index in 0..self.loaded_file_count() {
+            self.viewported_list_state
+                .invalidate_height_for_index(index);
         }
     }
 
@@ -1380,6 +1400,10 @@ impl CodeReviewView {
             file_sidebar_expanded_before_maximize: None,
             staged_section_collapsed: false,
             unstaged_section_collapsed: false,
+            staged_header_mouse_state: MouseStateHandle::default(),
+            unstaged_header_mouse_state: MouseStateHandle::default(),
+            staged_sidebar_header_mouse_state: MouseStateHandle::default(),
+            unstaged_sidebar_header_mouse_state: MouseStateHandle::default(),
             position_id_prefix: random_str,
             viewported_list_state: list_state,
             scroll_state: ScrollStateHandle::default(),
@@ -4847,6 +4871,7 @@ impl CodeReviewView {
                 self.staged_section_collapsed,
                 CodeReviewAction::ToggleStagedSectionCollapsed,
                 appearance,
+                self.staged_sidebar_header_mouse_state.clone(),
             ));
             if !self.staged_section_collapsed {
                 for (index, file_state) in staged {
@@ -4862,6 +4887,7 @@ impl CodeReviewView {
                 self.unstaged_section_collapsed,
                 CodeReviewAction::ToggleUnstagedSectionCollapsed,
                 appearance,
+                self.unstaged_sidebar_header_mouse_state.clone(),
             ));
             if !self.unstaged_section_collapsed {
                 for (index, file_state) in unstaged {
@@ -4960,6 +4986,7 @@ impl CodeReviewView {
         collapsed: bool,
         toggle_action: CodeReviewAction,
         appearance: &Appearance,
+        mouse_state: MouseStateHandle,
     ) -> Box<dyn Element> {
         let theme = appearance.theme();
         let chevron = if collapsed {
@@ -4968,6 +4995,7 @@ impl CodeReviewView {
             Icon::ChevronDown
         };
         let icon_color = theme.sub_text_color(theme.surface_2());
+        let label_color = theme.sub_text_color(theme.surface_2());
 
         let mut row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
         row.add_child(
@@ -4981,21 +5009,46 @@ impl CodeReviewView {
                 .with_height(14.)
                 .finish(),
             )
-            .with_margin_right(4.)
+            .with_margin_right(6.)
             .finish(),
         );
+        // Uppercase, muted label (VS Code SCM style) so the section reads as a group title
+        // rather than another file row.
         row.add_child(
-            Text::new(
-                format!("{label} ({count})"),
-                appearance.ui_font_family(),
-                appearance.ui_font_size(),
+            Container::new(
+                Text::new(
+                    label.to_uppercase(),
+                    appearance.ui_font_family(),
+                    appearance.ui_font_size() - 1.,
+                )
+                .with_color(label_color.into())
+                .soft_wrap(false)
+                .finish(),
             )
-            .with_color(theme.main_text_color(theme.surface_2()).into())
-            .soft_wrap(false)
+            .with_margin_right(6.)
+            .finish(),
+        );
+        // Count badge.
+        row.add_child(
+            Container::new(
+                Text::new(
+                    count.to_string(),
+                    appearance.ui_font_family(),
+                    appearance.ui_font_size() - 1.,
+                )
+                .with_color(label_color.into())
+                .soft_wrap(false)
+                .finish(),
+            )
+            .with_horizontal_padding(6.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+            .with_background(warp_core::ui::theme::Fill::Solid(internal_colors::neutral_3(
+                theme,
+            )))
             .finish(),
         );
 
-        Hoverable::new(MouseStateHandle::default(), |_mouse_state| {
+        let header_row = Hoverable::new(mouse_state, |_mouse_state| {
             Container::new(row.finish())
                 .with_vertical_padding(6.)
                 .with_horizontal_padding(8.)
@@ -5005,7 +5058,24 @@ impl CodeReviewView {
             ctx.dispatch_typed_action(toggle_action.clone());
         })
         .with_cursor(Cursor::PointingHand)
-        .finish()
+        .finish();
+
+        // Thin full-width divider beneath the header to delineate the section group.
+        let divider = Container::new(
+            ConstrainedBox::new(Empty::new().finish())
+                .with_height(1.)
+                .finish(),
+        )
+        .with_background(warp_core::ui::theme::Fill::Solid(internal_colors::neutral_3(
+            theme,
+        )))
+        .finish();
+
+        Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(header_row)
+            .with_child(divider)
+            .finish()
     }
 
     fn render_file_sidebar_row(
@@ -5170,6 +5240,13 @@ impl CodeReviewView {
         )
     }
 
+    fn staging_section_header_position(&self, file_index: usize) -> String {
+        format!(
+            "CodeReviewView-{}-StagingHeader-{file_index}",
+            self.position_id_prefix
+        )
+    }
+
     /// Renders a single file's diff
     fn render_file_diff(
         &self,
@@ -5179,33 +5256,76 @@ impl CodeReviewView {
         appearance: &Appearance,
         app: &AppContext,
     ) -> Box<dyn Element> {
-        // Staging area: prepend a "Staged Changes (N)" / "Changes (N)" divider at each
-        // section boundary. The loader emits staged file states first, so the first staged
+        // Staging area: prepend a collapsible "Staged Changes (N)" / "Changes (N)" header at
+        // each section boundary. The loader emits staged file states first, so the first staged
         // file is index 0 and the first unstaged file is at index == staged_count.
-        let section_divider = if self.staging_area_enabled(app) {
+        let (section_header, section_collapsed) = if self.staging_area_enabled(app) {
             let staged_count = self.staged_file_count();
-            match file.file_diff.staging_section {
-                StagingSection::Staged if file_index == 0 => {
-                    Some(self.render_main_section_divider("Staged Changes", staged_count, appearance))
-                }
+            let section = file.file_diff.staging_section;
+            let collapsed = match section {
+                StagingSection::Staged => self.staged_section_collapsed,
+                StagingSection::Unstaged => self.unstaged_section_collapsed,
+            };
+            let header = match section {
+                StagingSection::Staged if file_index == 0 => Some(self.render_staging_section_header(
+                    "Staged Changes",
+                    staged_count,
+                    self.staged_section_collapsed,
+                    CodeReviewAction::ToggleStagedSectionCollapsed,
+                    appearance,
+                    self.staged_header_mouse_state.clone(),
+                )),
                 StagingSection::Unstaged if file_index == staged_count => {
                     let unstaged_count = self.loaded_file_count().saturating_sub(staged_count);
-                    Some(self.render_main_section_divider("Changes", unstaged_count, appearance))
+                    Some(self.render_staging_section_header(
+                        "Changes",
+                        unstaged_count,
+                        self.unstaged_section_collapsed,
+                        CodeReviewAction::ToggleUnstagedSectionCollapsed,
+                        appearance,
+                        self.unstaged_header_mouse_state.clone(),
+                    ))
                 }
                 _ => None,
-            }
+            };
+            (header, collapsed)
         } else {
-            None
+            (None, false)
         };
 
+        // When a section is collapsed, render only its header (on the boundary file) and hide
+        // every file in that section.
+        if section_collapsed {
+            return match section_header {
+                Some(header) => Container::new(header).with_margin_bottom(EDITOR_GAP).finish(),
+                None => Empty::new().finish(),
+            };
+        }
+
         let is_item_being_scrolled = file_index == scroll_offset_from_top.list_item_index();
-        // This helps us avoid rendering the sticky header for the first time when scrolled to the very top.
-        let is_first_item_with_no_scroll = file_index == 0
-            && scroll_offset_from_top.list_item_index() == 0
-            && scroll_offset_from_top.offset_from_start().as_f32() < 1.;
+        // Height of the prepended staging section header (0 when this file has none). The
+        // header lives inside this list item, above the file block, so the sticky-header
+        // offset must subtract it — otherwise the sticky title floats one header-height too
+        // low (the symptom seen only on the first file of each section).
+        let section_header_height = if section_header.is_some() {
+            app.element_position_by_id_at_last_frame(
+                self.window_id,
+                self.staging_section_header_position(file_index),
+            )
+            .map(|rect| rect.height())
+            .unwrap_or(STAGING_SECTION_HEADER_HEIGHT)
+        } else {
+            0.
+        };
+        // Distance scrolled into the file body itself, past any section header. The sticky
+        // header engages only once the body starts sliding under the fixed area; this also
+        // suppresses it at the very top, replacing the old `is_first_item_with_no_scroll`.
+        let file_offset =
+            (scroll_offset_from_top.offset_from_start().as_f32() - section_header_height).max(0.);
+        let sticky_active = is_item_being_scrolled && file.is_expanded && file_offset > 1.;
 
         let file_header =
-            if is_item_being_scrolled && file.is_expanded && !is_first_item_with_no_scroll {
+            if sticky_active {
                 Empty::new().finish()
             } else {
                 let header = SavePosition::new(
@@ -5230,7 +5350,7 @@ impl CodeReviewView {
                 SavePosition::new(
                     Container::new(self.render_file_content(file, appearance, app))
                         .with_margin_top(
-                            if is_item_being_scrolled && !is_first_item_with_no_scroll {
+                            if sticky_active {
                                 // This is the height of the header bar needs to be present. Otherwise,
                                 // the file contents shift up by this amount.
                                 if let Some(header_rect) = app.element_position_by_id_at_last_frame(
@@ -5250,13 +5370,13 @@ impl CodeReviewView {
                 )
                 .finish(),
             );
-            if is_item_being_scrolled && !is_first_item_with_no_scroll {
+            if sticky_active {
                 let sticky_file_header = self.render_file_header(file, appearance, app);
                 stack.add_positioned_child(
                     sticky_file_header,
                     // We effectively make this an absolutely positioned header.
                     OffsetPositioning::offset_from_parent(
-                        vec2f(0., scroll_offset_from_top.offset_from_start().as_f32()),
+                        vec2f(0., file_offset),
                         warpui::elements::ParentOffsetBounds::ParentByPosition,
                         warpui::elements::ParentAnchor::TopMiddle,
                         warpui::elements::ChildAnchor::TopMiddle,
@@ -5271,39 +5391,17 @@ impl CodeReviewView {
             .with_margin_bottom(EDITOR_GAP)
             .finish();
 
-        match section_divider {
-            Some(divider) => Flex::column()
+        match section_header {
+            Some(header) => Flex::column()
                 .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-                .with_child(divider)
+                .with_child(
+                    SavePosition::new(header, &self.staging_section_header_position(file_index))
+                        .finish(),
+                )
                 .with_child(file_block)
                 .finish(),
             None => file_block,
         }
-    }
-
-    /// Renders a staging-area section divider ("Staged Changes (N)" / "Changes (N)") shown
-    /// above the first file of each section in the main code-review diff list.
-    fn render_main_section_divider(
-        &self,
-        label: &str,
-        count: usize,
-        appearance: &Appearance,
-    ) -> Box<dyn Element> {
-        let theme = appearance.theme();
-        Container::new(
-            Text::new(
-                format!("{}  ({count})", label.to_uppercase()),
-                appearance.ui_font_family(),
-                appearance.ui_font_size(),
-            )
-            .with_color(theme.sub_text_color(theme.surface_2()).into())
-            .soft_wrap(false)
-            .finish(),
-        )
-        .with_vertical_padding(6.)
-        .with_horizontal_padding(4.)
-        .with_margin_bottom(4.)
-        .finish()
     }
 
     /// Renders the file header with name and status
@@ -8132,10 +8230,13 @@ impl TypedActionView for CodeReviewView {
             }
             CodeReviewAction::ToggleStagedSectionCollapsed => {
                 self.staged_section_collapsed = !self.staged_section_collapsed;
+                // Collapsed files render to zero height; force the virtualized list to re-measure.
+                self.invalidate_all_file_heights();
                 ctx.notify();
             }
             CodeReviewAction::ToggleUnstagedSectionCollapsed => {
                 self.unstaged_section_collapsed = !self.unstaged_section_collapsed;
+                self.invalidate_all_file_heights();
                 ctx.notify();
             }
         }
