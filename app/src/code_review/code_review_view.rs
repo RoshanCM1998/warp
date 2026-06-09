@@ -4997,7 +4997,11 @@ impl CodeReviewView {
         let icon_color = theme.sub_text_color(theme.surface_2());
         let label_color = theme.sub_text_color(theme.surface_2());
 
-        let mut row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+        let mut row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            // Fill the available width so the header (and its border when collapsed) spans the
+            // full section width, not just the title content. Also widens the click target.
+            .with_main_axis_size(MainAxisSize::Max);
         row.add_child(
             Container::new(
                 ConstrainedBox::new(
