@@ -4,8 +4,10 @@
 
 use std::path::Path;
 
+use warp_core::features::FeatureFlag;
 use warp_core::send_telemetry_from_ctx;
 use warp_core::ui::appearance::Appearance;
+use warp_editor::editor::NavigationKey;
 use warpui::elements::{
     ChildView, ClippedScrollStateHandle, Container, CornerRadius, CrossAxisAlignment, Element,
     Flex, MainAxisAlignment, MainAxisSize, MouseStateHandle, ParentElement, Radius, Text,
@@ -25,10 +27,11 @@ use crate::code_review::telemetry_event::{
     CodeReviewTelemetryEvent, GitDialogStatus, GitOperationKind,
 };
 use crate::editor::{
-    EditorOptions, EditorView, Event as EditorEvent, InteractionState,
+    EditorOptions, EditorView, EnterAction, EnterSettings, Event as EditorEvent, InteractionState,
     PropagateAndNoOpNavigationKeys, TextOptions,
 };
 use crate::server::server_api::ServerApiProvider;
+use crate::settings::CodeSettings;
 use crate::ui_components::icons::Icon;
 use crate::util::git::{
     create_pr, get_diff_for_commit_message, get_file_change_entries, run_commit, run_push,
@@ -58,6 +61,9 @@ enum CommitOutcome {
 #[derive(Clone, Debug, PartialEq)]
 pub enum CommitSubAction {
     SetIntent(CommitIntent),
+    /// Advance the intent selector to the next available option (Tab). Wraps around,
+    /// skipping "Commit and create PR" when it isn't offered for this branch.
+    CycleIntent,
     ToggleIncludeUnstaged,
     ToggleChangesExpanded,
 }
@@ -130,6 +136,12 @@ pub(super) fn new_state(
             },
             soft_wrap: true,
             autogrow: true,
+            // Ctrl+Enter should confirm the commit, not insert a newline — emit it as an event
+            // (handled in `handle_editor_event`) instead of the default multi-line newline.
+            enter_settings: EnterSettings {
+                ctrl_enter: EnterAction::Emit,
+                ..Default::default()
+            },
             propagate_and_no_op_vertical_navigation_keys: PropagateAndNoOpNavigationKeys::Always,
             supports_vim_mode: false,
             single_line: false,
@@ -184,7 +196,12 @@ pub(super) fn new_state(
         None
     };
 
-    let include_unstaged = true;
+    // With the staging area on, the user manages staged vs. unstaged explicitly, so the commit
+    // dialog should default to committing only what's staged. Without it, keep the old
+    // "everything" default.
+    let staging_area_enabled =
+        FeatureFlag::CodeReviewStaging.is_enabled() && *CodeSettings::as_ref(ctx).staging_area;
+    let include_unstaged = !staging_area_enabled;
     let repo_path_for_load = repo_path.to_path_buf();
     ctx.spawn(
         async move { get_file_change_entries(&repo_path_for_load, include_unstaged).await },
@@ -335,6 +352,22 @@ pub(super) fn handle_sub_action(
                 apply_intent_selector(state, ctx);
             }
         }
+        CommitSubAction::CycleIntent => {
+            if let GitDialogMode::Commit(state) = me.mode_mut() {
+                let pr_available = state.commit_and_create_pr_button.is_some();
+                state.intent = match state.intent {
+                    CommitIntent::CommitOnly => CommitIntent::CommitAndPush,
+                    CommitIntent::CommitAndPush if pr_available => {
+                        CommitIntent::CommitAndCreatePr
+                    }
+                    CommitIntent::CommitAndPush => CommitIntent::CommitOnly,
+                    CommitIntent::CommitAndCreatePr => CommitIntent::CommitOnly,
+                };
+            }
+            if let GitDialogMode::Commit(state) = me.mode() {
+                apply_intent_selector(state, ctx);
+            }
+        }
         CommitSubAction::ToggleIncludeUnstaged => {
             if let GitDialogMode::Commit(state) = me.mode_mut() {
                 state.include_unstaged = !state.include_unstaged;
@@ -467,6 +500,17 @@ fn handle_editor_event(me: &mut GitDialog, event: &EditorEvent, ctx: &mut ViewCo
             if !me.loading() {
                 ctx.emit(GitDialogEvent::Cancelled);
             }
+        }
+        // Ctrl+Enter confirms the commit with the currently selected intent. `start_confirm`
+        // guards an empty message, so this is safe even though it bypasses the disabled button.
+        EditorEvent::CtrlEnter => {
+            if !me.loading() {
+                start_confirm(me, ctx);
+            }
+        }
+        // Tab cycles the intent selector (Commit → Commit and push → Commit and create PR).
+        EditorEvent::Navigate(NavigationKey::Tab) => {
+            handle_sub_action(me, &CommitSubAction::CycleIntent, ctx);
         }
         EditorEvent::Edited(_) => {
             me.refresh_confirm_enabled(ctx);

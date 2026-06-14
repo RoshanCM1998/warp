@@ -63,11 +63,27 @@ pub enum GitDialogKind {
 }
 
 pub fn init(ctx: &mut AppContext) {
-    ctx.register_fixed_bindings(vec![FixedBinding::new(
-        "escape",
-        GitDialogAction::Cancel,
-        warpui::id!("GitDialog"),
-    )]);
+    ctx.register_fixed_bindings(vec![
+        FixedBinding::new("escape", GitDialogAction::Cancel, warpui::id!("GitDialog")),
+        // Ctrl+Enter confirms the dialog (runs the selected commit intent), regardless of
+        // which control has focus — the multi-line message editor keeps plain Enter for newlines.
+        FixedBinding::new(
+            "ctrl-enter",
+            GitDialogAction::Confirm,
+            warpui::id!("GitDialog"),
+        ),
+        FixedBinding::new(
+            "ctrl-numpadenter",
+            GitDialogAction::Confirm,
+            warpui::id!("GitDialog"),
+        ),
+        // Tab cycles the intent selector (Commit → Commit and push → Commit and create PR).
+        FixedBinding::new(
+            "tab",
+            GitDialogAction::Commit(CommitSubAction::CycleIntent),
+            warpui::id!("GitDialog"),
+        ),
+    ]);
 }
 
 /// Future that resolves to the user's interactive-shell `PATH` (or `None`
