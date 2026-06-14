@@ -367,6 +367,10 @@ pub enum CodeReviewAction {
     StageFile(String),
     /// Unstage a file (move it back into the "Changes" section). `String` is the repo-relative path.
     UnstageFile(String),
+    /// Stage every file currently in the "Changes" (unstaged) section.
+    StageAll,
+    /// Unstage every file currently in the "Staged Changes" section.
+    UnstageAll,
     /// Collapse/expand the "Staged Changes" section in the file sidebar.
     ToggleStagedSectionCollapsed,
     /// Collapse/expand the "Changes" section in the file sidebar.
@@ -634,6 +638,11 @@ pub struct CodeReviewView {
     unstaged_header_mouse_state: MouseStateHandle,
     staged_sidebar_header_mouse_state: MouseStateHandle,
     unstaged_sidebar_header_mouse_state: MouseStateHandle,
+    /// "Stage All" / "Unstage All" affordances shown on the sidebar section headers when the
+    /// staging area is enabled. Persistent view handles so a single `ActionButton` view backs
+    /// each across render loops (an `ActionButton` view can only live in one spot in the tree).
+    stage_all_button: ViewHandle<ActionButton>,
+    unstage_all_button: ViewHandle<ActionButton>,
     scroll_state: ScrollStateHandle,
     viewported_list_state: ListState<RelocatableScrollContext>,
 
@@ -1248,6 +1257,22 @@ impl CodeReviewView {
                 })
         });
 
+        let stage_all_button = ctx.add_typed_action_view(|_ctx| {
+            ActionButton::new("Stage All", NakedTheme)
+                .with_icon(Icon::Plus)
+                .with_size(ButtonSize::InlineActionHeader)
+                .with_tooltip("Stage all changes")
+                .on_click(|ctx| ctx.dispatch_typed_action(CodeReviewAction::StageAll))
+        });
+
+        let unstage_all_button = ctx.add_typed_action_view(|_ctx| {
+            ActionButton::new("Unstage All", NakedTheme)
+                .with_icon(Icon::Minus)
+                .with_size(ButtonSize::InlineActionHeader)
+                .with_tooltip("Unstage all changes")
+                .on_click(|ctx| ctx.dispatch_typed_action(CodeReviewAction::UnstageAll))
+        });
+
         let git_operations_menu = ctx.add_typed_action_view(|_| {
             Menu::new()
                 .prevent_interaction_with_other_elements()
@@ -1404,6 +1429,8 @@ impl CodeReviewView {
             unstaged_header_mouse_state: MouseStateHandle::default(),
             staged_sidebar_header_mouse_state: MouseStateHandle::default(),
             unstaged_sidebar_header_mouse_state: MouseStateHandle::default(),
+            stage_all_button,
+            unstage_all_button,
             position_id_prefix: random_str,
             viewported_list_state: list_state,
             scroll_state: ScrollStateHandle::default(),
@@ -4872,6 +4899,7 @@ impl CodeReviewView {
                 CodeReviewAction::ToggleStagedSectionCollapsed,
                 appearance,
                 self.staged_sidebar_header_mouse_state.clone(),
+                None,
             ));
             if !self.staged_section_collapsed {
                 for (index, file_state) in staged {
@@ -4888,6 +4916,7 @@ impl CodeReviewView {
                 CodeReviewAction::ToggleUnstagedSectionCollapsed,
                 appearance,
                 self.unstaged_sidebar_header_mouse_state.clone(),
+                None,
             ));
             if !self.unstaged_section_collapsed {
                 for (index, file_state) in unstaged {
@@ -4987,6 +5016,7 @@ impl CodeReviewView {
         toggle_action: CodeReviewAction,
         appearance: &Appearance,
         mouse_state: MouseStateHandle,
+        action_button: Option<&ViewHandle<ActionButton>>,
     ) -> Box<dyn Element> {
         let theme = appearance.theme();
         let chevron = if collapsed {
@@ -4997,12 +5027,9 @@ impl CodeReviewView {
         let icon_color = theme.sub_text_color(theme.surface_2());
         let label_color = theme.sub_text_color(theme.surface_2());
 
-        let mut row = Flex::row()
-            .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            // Fill the available width so the header (and its border when collapsed) spans the
-            // full section width, not just the title content. Also widens the click target.
-            .with_main_axis_size(MainAxisSize::Max);
-        row.add_child(
+        // Title group (chevron + uppercase label + count pill) on the left.
+        let mut left_group = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+        left_group.add_child(
             Container::new(
                 ConstrainedBox::new(
                     chevron
@@ -5018,7 +5045,7 @@ impl CodeReviewView {
         );
         // Uppercase, muted label (VS Code SCM style) so the section reads as a group title
         // rather than another file row.
-        row.add_child(
+        left_group.add_child(
             Container::new(
                 Text::new(
                     label.to_uppercase(),
@@ -5033,7 +5060,7 @@ impl CodeReviewView {
             .finish(),
         );
         // Subtle, compact count pill.
-        row.add_child(
+        left_group.add_child(
             Container::new(
                 Text::new(
                     count.to_string(),
@@ -5053,12 +5080,27 @@ impl CodeReviewView {
             .finish(),
         );
 
-        // No hard divider — separation comes from generous top space above each section and
-        // the header hugging the file cards beneath it (clean, VS Code SCM style).
+        // Fill the available width so the header (and its border when collapsed) spans the full
+        // section width, and push the optional "Stage All" / "Unstage All" button to the far
+        // right. The button has its own click handler, so it stages/unstages without also
+        // toggling the section collapse.
+        let mut row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_main_axis_alignment(MainAxisAlignment::SpaceBetween);
+        row.add_child(left_group.finish());
+        if count > 0 {
+            if let Some(button) = action_button {
+                row.add_child(ChildView::new(button).finish());
+            }
+        }
+
+        // No hard divider — separation comes from generous space above and below each section so
+        // the header reads as its own group title (clean, VS Code SCM style).
         Hoverable::new(mouse_state, |_mouse_state| {
             Container::new(row.finish())
                 .with_padding_top(14.)
-                .with_padding_bottom(6.)
+                .with_padding_bottom(12.)
                 .with_horizontal_padding(8.)
                 .finish()
         })
@@ -5265,6 +5307,7 @@ impl CodeReviewView {
                     CodeReviewAction::ToggleStagedSectionCollapsed,
                     appearance,
                     self.staged_header_mouse_state.clone(),
+                    Some(&self.unstage_all_button),
                 )),
                 StagingSection::Unstaged if file_index == staged_count => {
                     let unstaged_count = self.loaded_file_count().saturating_sub(staged_count);
@@ -5275,6 +5318,7 @@ impl CodeReviewView {
                         CodeReviewAction::ToggleUnstagedSectionCollapsed,
                         appearance,
                         self.unstaged_header_mouse_state.clone(),
+                        Some(&self.stage_all_button),
                     ))
                 }
                 _ => None,
@@ -6152,6 +6196,27 @@ impl CodeReviewView {
             .with_background_color(appearance.theme().blurred_background_overlay().into())
             .with_corner_radius(app.windows().window_corner_radius())
             .finish()
+    }
+
+    /// Collects `FileStatusInfo` for every loaded file in the given staging section. Used by the
+    /// "Stage All" / "Unstage All" header actions. A partially-staged file appears in both
+    /// sections, so filtering by `staging_section` keeps each batch to the intended side.
+    fn collect_section_file_infos(&self, section: StagingSection) -> Vec<FileStatusInfo> {
+        let CodeReviewViewState::Loaded(loaded_state) = self.state() else {
+            return Vec::new();
+        };
+        loaded_state
+            .file_states
+            .values()
+            .filter(|fs| fs.file_diff.staging_section == section)
+            .filter_map(|fs| {
+                let path = self.to_standardized_path(&fs.file_diff.file_path)?;
+                Some(FileStatusInfo {
+                    path,
+                    status: fs.file_diff.status.clone(),
+                })
+            })
+            .collect()
     }
 
     fn create_file_status_info(&self, path: StandardizedPath) -> FileStatusInfo {
@@ -8275,6 +8340,22 @@ impl TypedActionView for CodeReviewView {
                     let info = self.create_file_status_info(std_path);
                     self.diff_state_model.update(ctx, |model, ctx| {
                         model.unstage_files(vec![info], ctx);
+                    });
+                }
+            }
+            CodeReviewAction::StageAll => {
+                let infos = self.collect_section_file_infos(StagingSection::Unstaged);
+                if !infos.is_empty() {
+                    self.diff_state_model.update(ctx, |model, ctx| {
+                        model.stage_files(infos, ctx);
+                    });
+                }
+            }
+            CodeReviewAction::UnstageAll => {
+                let infos = self.collect_section_file_infos(StagingSection::Staged);
+                if !infos.is_empty() {
+                    self.diff_state_model.update(ctx, |model, ctx| {
+                        model.unstage_files(infos, ctx);
                     });
                 }
             }
