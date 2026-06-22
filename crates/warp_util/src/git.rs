@@ -2,6 +2,14 @@ use std::path::Path;
 
 use anyhow::{anyhow, Result};
 
+/// Hard ceiling for any single git invocation. Local read ops (status/diff/show)
+/// finish in milliseconds and even a network fetch/push completes well within
+/// this; a git process that runs longer is hung, not slow. Without this, a hung
+/// git process leaves its awaiter (e.g. the code-review diff load) spinning
+/// forever. The cap turns that into a recoverable error instead.
+#[cfg(not(target_family = "wasm"))]
+const GIT_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Runs a git command and returns the output as a string.
 /// Thin wrapper over [`run_git_command_with_env`] with no `PATH` override.
 #[cfg(not(target_family = "wasm"))]
@@ -37,10 +45,23 @@ pub async fn run_git_command_with_env(
     if let Some(path_env) = path_env {
         cmd.env("PATH", path_env);
     }
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| anyhow!("Failed to execute git command: {}", e))?;
+    // Race the git invocation against a hard timeout. If the timer wins, the
+    // boxed `output` future (and the `Command` it owns, which has
+    // `kill_on_drop(true)`) is dropped, terminating the hung git process.
+    use futures_util::future::{select, Either};
+    let output_fut = Box::pin(cmd.output());
+    let output = match select(output_fut, async_io::Timer::after(GIT_COMMAND_TIMEOUT)).await {
+        Either::Left((output, _timer)) => {
+            output.map_err(|e| anyhow!("Failed to execute git command: {}", e))?
+        }
+        Either::Right((_elapsed, _output_fut)) => {
+            anyhow::bail!(
+                "git command timed out after {}s: git {}",
+                GIT_COMMAND_TIMEOUT.as_secs(),
+                args.join(" ")
+            );
+        }
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr);

@@ -30,6 +30,9 @@ pin-project.workspace = true
 futures-util.workspace = true
 log.workspace = true
 
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+async-io.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
 

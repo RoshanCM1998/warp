@@ -1665,30 +1665,42 @@ impl LocalDiffStateModel {
         }
         file.rewind()?;
 
-        if file.metadata()?.len() > MAX_FILE_SIZE_TO_READ_LINES {
+        let len = file.metadata()?.len();
+        if len > MAX_FILE_SIZE_TO_READ_LINES {
             return Ok(None);
         }
 
-        Self::num_lines_in_file(file).await.map(Some)
+        Self::num_lines_in_file(file, len).await.map(Some)
     }
 
     /// Returns the number of lines in a file. This is optimized to avoid loading the entire file into memory.
-    async fn num_lines_in_file(file: File) -> Result<usize> {
+    ///
+    /// Reads at most `max_bytes` — the file length snapshotted by the caller. The cap is
+    /// load-bearing: this runs for untracked files, and a file being continuously appended to
+    /// by another process would otherwise never reach EOF here, leaving this loop (and the
+    /// diff-metadata load that awaits it) spinning forever. Bounding to the open-time length
+    /// makes it a finite forward pass regardless of concurrent writes.
+    async fn num_lines_in_file(file: File, max_bytes: u64) -> Result<usize> {
         // Read in chunks of 64 KBs.
         const CHUNK_SIZE: usize = 1024 * 64;
 
         let mut reader = BufReader::with_capacity(CHUNK_SIZE, file);
         let mut count = 0;
-        loop {
-            let len = {
+        let mut remaining = max_bytes;
+        while remaining > 0 {
+            let consumed = {
                 let buf = reader.fill_buf()?;
                 if buf.is_empty() {
                     break;
                 }
-                count += bytecount::count(buf, b'\n');
-                buf.len()
+                // Only count newlines within the snapshotted length; ignore any bytes
+                // appended after we started reading.
+                let take = buf.len().min(remaining as usize);
+                count += bytecount::count(&buf[..take], b'\n');
+                take
             };
-            reader.consume(len);
+            reader.consume(consumed);
+            remaining -= consumed as u64;
             // Yield so that an attempt to abort this operation is handled.
             futures_lite::future::yield_now().await;
         }
