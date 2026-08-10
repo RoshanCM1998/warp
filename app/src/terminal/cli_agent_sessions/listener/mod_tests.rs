@@ -1,6 +1,6 @@
 use super::*;
 use crate::terminal::cli_agent_sessions::event::{
-    CLIAgentEventSource, CLIAgentEventType, CLI_AGENT_NOTIFICATION_SENTINEL,
+    CLI_AGENT_NOTIFICATION_SENTINEL, CLIAgentEventSource, CLIAgentEventType,
 };
 
 #[test]
@@ -43,9 +43,11 @@ fn codex_ignores_empty_body() {
 #[test]
 fn codex_try_parse_ignores_titled_notifications() {
     let mut handler = CodexSessionHandler;
-    assert!(handler
-        .try_parse(Some("some-title"), "Agent turn complete", false)
-        .is_none());
+    assert!(
+        handler
+            .try_parse(Some("some-title"), "Agent turn complete", false)
+            .is_none()
+    );
 }
 
 #[test]
@@ -69,9 +71,11 @@ fn codex_try_parse_ignores_osc9_when_plugin_already_active() {
 
     assert_eq!(event.event, CLIAgentEventType::PermissionRequest);
     // Once the session is rich, OSC 9 fallback is dropped.
-    assert!(handler
-        .try_parse(None, "Agent turn complete", true)
-        .is_none());
+    assert!(
+        handler
+            .try_parse(None, "Agent turn complete", true)
+            .is_none()
+    );
 }
 
 #[test]
@@ -80,12 +84,16 @@ fn codex_try_parse_ignores_structured_event_without_codex_plugin() {
     let mut handler = CodexSessionHandler;
     let body = r#"{"v":1,"agent":"codex","event":"permission_request","summary":"Approve?","tool_name":"Bash"}"#;
 
-    assert!(handler
-        .try_parse(Some(CLI_AGENT_NOTIFICATION_SENTINEL), body, false)
-        .is_none());
-    assert!(handler
-        .try_parse(None, "Agent turn complete", false)
-        .is_some());
+    assert!(
+        handler
+            .try_parse(Some(CLI_AGENT_NOTIFICATION_SENTINEL), body, false)
+            .is_none()
+    );
+    assert!(
+        handler
+            .try_parse(None, "Agent turn complete", false)
+            .is_some()
+    );
 }
 
 #[test]
@@ -93,12 +101,16 @@ fn codex_try_parse_ignores_other_structured_agents() {
     let mut handler = CodexSessionHandler;
     let body = r#"{"v":1,"agent":"claude","event":"stop"}"#;
 
-    assert!(handler
-        .try_parse(Some(CLI_AGENT_NOTIFICATION_SENTINEL), body, false)
-        .is_none());
-    assert!(handler
-        .try_parse(None, "Agent turn complete", false)
-        .is_some());
+    assert!(
+        handler
+            .try_parse(Some(CLI_AGENT_NOTIFICATION_SENTINEL), body, false)
+            .is_none()
+    );
+    assert!(
+        handler
+            .try_parse(None, "Agent turn complete", false)
+            .is_some()
+    );
 }
 
 #[test]
@@ -144,6 +156,11 @@ fn pi_is_supported() {
 }
 
 #[test]
+fn oh_my_pi_is_supported() {
+    assert!(is_agent_supported(&CLIAgent::OhMyPi));
+}
+
+#[test]
 fn pi_default_handler_skips_session_start() {
     let mut handler = DefaultSessionListener;
     let event = CLIAgentEvent {
@@ -173,4 +190,98 @@ fn pi_default_handler_forwards_stop() {
         payload: CLIAgentEventPayload::default(),
     };
     assert!(handler.handle_event(event).is_some());
+}
+
+#[test]
+fn droid_is_supported() {
+    assert!(is_agent_supported(&CLIAgent::Droid));
+}
+
+#[test]
+fn droid_default_handler_skips_session_start() {
+    let mut handler = DefaultSessionListener;
+    let event = CLIAgentEvent {
+        source: CLIAgentEventSource::RichPlugin,
+        v: 1,
+        agent: CLIAgent::Droid,
+        event: CLIAgentEventType::SessionStart,
+        session_id: None,
+        cwd: None,
+        project: None,
+        payload: CLIAgentEventPayload::default(),
+    };
+    assert!(handler.handle_event(event).is_none());
+}
+
+#[test]
+fn droid_default_handler_forwards_stop() {
+    let mut handler = DefaultSessionListener;
+    let event = CLIAgentEvent {
+        source: CLIAgentEventSource::RichPlugin,
+        v: 1,
+        agent: CLIAgent::Droid,
+        event: CLIAgentEventType::Stop,
+        session_id: None,
+        cwd: None,
+        project: None,
+        payload: CLIAgentEventPayload::default(),
+    };
+    assert!(handler.handle_event(event).is_some());
+}
+
+#[test]
+fn droid_default_handler_forwards_permission_request() {
+    let mut handler = DefaultSessionListener;
+    let event = CLIAgentEvent {
+        source: CLIAgentEventSource::RichPlugin,
+        v: 1,
+        agent: CLIAgent::Droid,
+        event: CLIAgentEventType::PermissionRequest,
+        session_id: None,
+        cwd: None,
+        project: None,
+        payload: CLIAgentEventPayload::default(),
+    };
+    assert!(handler.handle_event(event).is_some());
+}
+
+#[test]
+fn warp_tui_notifications_are_supported() {
+    assert!(is_agent_supported(&CLIAgent::WarpTui));
+    let mut handler = create_handler(&CLIAgent::WarpTui).expect("should create handler");
+    let stop_body = r#"{"v":1,"agent":"warp-tui","event":"stop","session_id":"sess-42"}"#;
+    let parsed_stop = handler
+        .try_parse(Some(CLI_AGENT_NOTIFICATION_SENTINEL), stop_body, false)
+        .expect("should parse stop");
+    assert_eq!(parsed_stop.agent, CLIAgent::WarpTui);
+    assert_eq!(parsed_stop.event, CLIAgentEventType::Stop);
+    assert!(handler.handle_event(parsed_stop).is_some());
+}
+
+#[test]
+fn oh_my_pi_end_to_end_parsing_and_handling() {
+    let mut handler = create_handler(&CLIAgent::OhMyPi).expect("should create handler");
+
+    // Test session_start payload: proves SessionStart is skipped
+    let start_body = r#"{"v":1,"agent":"omp","event":"session_start"}"#;
+    let parsed_start = handler
+        .try_parse(Some(CLI_AGENT_NOTIFICATION_SENTINEL), start_body, false)
+        .expect("should successfully parse session_start payload");
+    assert_eq!(parsed_start.agent, CLIAgent::OhMyPi);
+    assert_eq!(parsed_start.event, CLIAgentEventType::SessionStart);
+    assert!(handler.handle_event(parsed_start).is_none());
+
+    // Test stop payload: proves Stop forwards with CLIAgent::OhMyPi
+    let stop_body = r#"{"v":1,"agent":"omp","event":"stop"}"#;
+    let parsed_stop = handler
+        .try_parse(Some(CLI_AGENT_NOTIFICATION_SENTINEL), stop_body, false)
+        .expect("should successfully parse stop payload");
+    assert_eq!(parsed_stop.agent, CLIAgent::OhMyPi);
+    assert_eq!(parsed_stop.event, CLIAgentEventType::Stop);
+
+    let handled_stop = handler
+        .handle_event(parsed_stop)
+        .expect("should forward stop event");
+    assert_eq!(handled_stop.agent, CLIAgent::OhMyPi);
+    assert_eq!(handled_stop.event, CLIAgentEventType::Stop);
 }

@@ -4,8 +4,8 @@ use std::rc::Rc;
 use rust_embed::RustEmbed;
 
 use super::*;
-use crate::r#async::executor::{Background, Foreground};
 use crate::AssetProvider;
+use crate::r#async::executor::{Background, Foreground};
 
 #[derive(Clone, Copy, RustEmbed)]
 #[folder = "test_data"]
@@ -35,6 +35,7 @@ impl AssetProvider for Assets {
 fn new_asset_cache() -> AssetCache {
     AssetCache::new(
         Box::new(Assets),
+        ImageCache::new(),
         Foreground::test().into(),
         Background::default().into(),
     )
@@ -165,6 +166,42 @@ fn test_caches_svg_rendered_at_intrinsic_size() {
     );
 
     assert!(Rc::ptr_eq(&image, &image_again));
+}
+
+#[test]
+fn cloned_image_cache_evicts_shared_rendered_images() {
+    let image_cache = ImageCache::new();
+    let evicting_image_cache = image_cache.clone();
+    let asset_cache = AssetCache::new(
+        Box::new(Assets),
+        image_cache.clone(),
+        Foreground::test().into(),
+        Background::default().into(),
+    );
+    let source = AssetSource::Bundled {
+        path: "cache-test.svg",
+    };
+    let bounds = Vector2I::new(20, 10);
+    let image = load_bundled_image(
+        &image_cache,
+        &asset_cache,
+        "cache-test.svg",
+        bounds,
+        FitType::Contain,
+        AnimatedImageBehavior::FullAnimation,
+    );
+
+    evicting_image_cache.evict_image(&source);
+
+    let image_after_eviction = load_bundled_image(
+        &image_cache,
+        &asset_cache,
+        "cache-test.svg",
+        bounds,
+        FitType::Contain,
+        AnimatedImageBehavior::FullAnimation,
+    );
+    assert!(!Rc::ptr_eq(&image, &image_after_eviction));
 }
 
 #[test]
@@ -458,10 +495,12 @@ fn test_svg_text_rasterizes_with_loaded_system_fonts() {
         panic!("Expected static image");
     };
 
-    assert!(image
-        .rgba_bytes()
-        .chunks_exact(4)
-        .any(|pixel| pixel[3] != 0));
+    assert!(
+        image
+            .rgba_bytes()
+            .chunks_exact(4)
+            .any(|pixel| pixel[3] != 0)
+    );
 }
 
 #[test]
@@ -495,10 +534,12 @@ fn test_svg_text_rasterizes_with_bundled_sans_serif_fallback() {
         panic!("Expected static image");
     };
 
-    assert!(image
-        .rgba_bytes()
-        .chunks_exact(4)
-        .any(|pixel| pixel[3] != 0));
+    assert!(
+        image
+            .rgba_bytes()
+            .chunks_exact(4)
+            .any(|pixel| pixel[3] != 0)
+    );
 }
 
 #[test]

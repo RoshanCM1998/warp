@@ -5,7 +5,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use image::codecs::gif::GifDecoder;
 use image::codecs::webp::WebPDecoder;
 use image::imageops::FilterType;
@@ -796,12 +796,13 @@ struct RenderedImageCacheKey {
     fit_type: FitType,
     animated_image_behavior: AnimatedImageBehavior,
 }
+type RenderedImageCache = HashMap<u64, HashMap<RenderedImageCacheKey, Rc<Image>>>;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ImageCache {
     /// Map of rendered images of any ImageType already materialized for a certain size and fit.
     /// Uses the hashed AssetSource and rendered-image properties as a key.
-    images: RwLock<HashMap<u64, HashMap<RenderedImageCacheKey, Rc<Image>>>>,
+    images: Rc<RwLock<RenderedImageCache>>,
 }
 
 impl ImageCache {
@@ -932,12 +933,12 @@ impl ImageCache {
                 // If it is already in the image cache at the target size and fit, return it.
                 let cache = if should_cache_rendered_image {
                     let cache = self.images.upgradable_read();
-                    if let Some(inner_map) = cache.get(&cache_key) {
-                        if let Some(image) = inner_map.get(&rendered_image_cache_key) {
-                            return AssetState::Loaded {
-                                data: image.clone(),
-                            };
-                        }
+                    if let Some(inner_map) = cache.get(&cache_key)
+                        && let Some(image) = inner_map.get(&rendered_image_cache_key)
+                    {
+                        return AssetState::Loaded {
+                            data: image.clone(),
+                        };
                     }
                     Some(cache)
                 } else {

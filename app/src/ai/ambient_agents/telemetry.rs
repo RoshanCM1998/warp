@@ -1,5 +1,5 @@
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use strum_macros::{EnumDiscriminants, EnumIter};
 use warp_core::features::FeatureFlag;
 use warp_core::telemetry::{EnablementState, TelemetryEvent, TelemetryEventDesc};
@@ -18,6 +18,15 @@ pub enum CloudModeEntryPoint {
     OzLaunchModal,
     /// User re-entered Cloud Mode by clicking on an ambient agent entry block.
     EntryBlock,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffSurface {
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    Gui,
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+    Tui,
 }
 
 /// The entry point through which a local-to-cloud handoff was initiated.
@@ -110,6 +119,8 @@ pub enum CloudAgentTelemetryEvent {
     HandoffInitiated {
         /// How the handoff was triggered.
         entry_point: HandoffEntryPoint,
+        /// Frontend that initiated the handoff.
+        surface: HandoffSurface,
         /// Whether the handoff forked an existing conversation.
         forked_existing_conversation: bool,
         /// Whether the user submitted with an empty prompt buffer.
@@ -131,6 +142,15 @@ pub enum CloudAgentTelemetryEvent {
         /// itself may still fail downstream, so the wire prompt is not implied.
         derived_workspace_had_content: bool,
     },
+    /// The auto-handoff sleep discoverability prompt was surfaced on wake.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    SleepPromptShown,
+    /// User clicked "Enable" on the auto-handoff sleep prompt.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    SleepPromptEnabled,
+    /// User clicked "Dismiss" on the auto-handoff sleep prompt.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    SleepPromptDismissed,
 }
 
 impl TelemetryEvent for CloudAgentTelemetryEvent {
@@ -172,11 +192,13 @@ impl TelemetryEvent for CloudAgentTelemetryEvent {
             })),
             CloudAgentTelemetryEvent::HandoffInitiated {
                 entry_point,
+                surface,
                 forked_existing_conversation,
                 empty_prompt,
                 injection_path,
             } => Some(json!({
                 "entry_point": entry_point,
+                "surface": surface,
                 "forked_existing_conversation": forked_existing_conversation,
                 "empty_prompt": empty_prompt,
                 "injection_path": injection_path,
@@ -186,6 +208,9 @@ impl TelemetryEvent for CloudAgentTelemetryEvent {
             } => Some(json!({
                 "derived_workspace_had_content": derived_workspace_had_content,
             })),
+            CloudAgentTelemetryEvent::SleepPromptShown
+            | CloudAgentTelemetryEvent::SleepPromptEnabled
+            | CloudAgentTelemetryEvent::SleepPromptDismissed => None,
         }
     }
 
@@ -229,6 +254,9 @@ impl TelemetryEventDesc for CloudAgentTelemetryEventDiscriminants {
             Self::DispatchFailed => "AmbientAgent.DispatchFailed",
             Self::HandoffInitiated => "AmbientAgent.Handoff.Initiated",
             Self::HandoffSnapshotPrepared => "AmbientAgent.Handoff.SnapshotPrepared",
+            Self::SleepPromptShown => "AmbientAgent.Handoff.SleepPrompt.Shown",
+            Self::SleepPromptEnabled => "AmbientAgent.Handoff.SleepPrompt.Enabled",
+            Self::SleepPromptDismissed => "AmbientAgent.Handoff.SleepPrompt.Dismissed",
         }
     }
 
@@ -253,6 +281,15 @@ impl TelemetryEventDesc for CloudAgentTelemetryEventDiscriminants {
             Self::HandoffInitiated => "User initiated a local-to-cloud handoff",
             Self::HandoffSnapshotPrepared => {
                 "Handoff snapshot upload settled; reports whether it carried content"
+            }
+            Self::SleepPromptShown => {
+                "The auto-handoff sleep discoverability prompt was shown on wake"
+            }
+            Self::SleepPromptEnabled => {
+                "User enabled auto-handoff on sleep from the discoverability prompt"
+            }
+            Self::SleepPromptDismissed => {
+                "User dismissed the auto-handoff sleep discoverability prompt"
             }
         }
     }

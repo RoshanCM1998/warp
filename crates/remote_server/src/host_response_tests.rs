@@ -1,9 +1,9 @@
 use super::*;
 use crate::proto::{
-    delete_file_response, discard_files_response, save_buffer_response, server_message,
-    write_file_response, DeleteFileResponse, DeleteFileSuccess, DiscardFilesError,
-    DiscardFilesResponse, DiscardFilesSuccess, FileOperationError, SaveBufferResponse,
-    SaveBufferSuccess, ServerMessage, WriteFileResponse, WriteFileSuccess,
+    DeleteFileResponse, DeleteFileSuccess, DiscardFilesError, DiscardFilesResponse,
+    DiscardFilesSuccess, FileOperationError, SaveBufferResponse, SaveBufferSuccess, ServerMessage,
+    WriteFileResponse, WriteFileSuccess, delete_file_response, discard_files_response,
+    save_buffer_response, server_message, write_file_response,
 };
 
 fn msg(inner: server_message::Message) -> ServerMessage {
@@ -161,6 +161,12 @@ fn every_host_scoped_request_has_a_response_disposition() {
             M::DropCodebaseIndex(_) => "manager::drop_codebase_index",
             M::ResyncCodebase(_) => "manager::resync_codebase",
             M::ResolveConflict(_) => "manager::resolve_conflict",
+            M::GitCommitChain(_) => "manager::commit_chain",
+            M::GitPush(_) => "manager::push",
+            M::GitCreatePr(_) => "manager::create_pr",
+            M::GitGenerateCommitMessage(_) => "manager::generate_commit_message",
+            M::GitGetCommittedBranchFiles(_) => "manager::get_committed_branch_files",
+            M::RipgrepSearch(_) => "manager::start_ripgrep_search",
         }
     }
 

@@ -2,15 +2,15 @@ use warp_core::features::FeatureFlag;
 use warpui::{SingletonEntity, ViewContext};
 
 use super::rich_content::RichContentMetadata;
-use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::agent::CancellationReason;
+use crate::ai::agent::conversation::AIConversationId;
+use crate::ai::blocklist::QueuedQueryModel;
 use crate::ai::blocklist::block::{
     FinishReason, PendingUserQueryBlock, PendingUserQueryBlockEvent,
 };
-use crate::ai::blocklist::QueuedQueryModel;
 use crate::auth::AuthStateProvider;
-use crate::terminal::view::PendingUserQueryKind;
 use crate::terminal::TerminalView;
+use crate::terminal::view::PendingUserQueryKind;
 
 impl TerminalView {
     pub(super) fn pending_user_query_conversation_id(&self) -> Option<AIConversationId> {
@@ -167,7 +167,7 @@ impl TerminalView {
         }
 
         self.input.update(ctx, |input, ctx| {
-            input.submit_queued_prompt(prompt, ctx);
+            input.submit_user_query_now(prompt, ctx);
         });
     }
 
@@ -205,7 +205,7 @@ impl TerminalView {
             match reason {
                 FinishReason::Complete => {
                     terminal_view.input.update(ctx, |input, ctx| {
-                        input.submit_queued_prompt(prompt, ctx);
+                        input.submit_user_query_now(prompt, ctx);
                     });
                 }
                 FinishReason::Error

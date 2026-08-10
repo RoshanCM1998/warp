@@ -25,8 +25,8 @@
 use std::collections::HashMap;
 
 use warp_core::ui::appearance::Appearance;
-use warpui::platform::WindowStyle;
 use warpui::App;
+use warpui::platform::WindowStyle;
 
 use super::*;
 use crate::persistence::model::{ModelTokenUsage, PRIMARY_AGENT_CATEGORY};
@@ -39,6 +39,7 @@ fn placeholder_usage_info() -> ConversationUsageInfo {
         tool_calls: 0,
         models: Vec::new(),
         context_window_usage: 0.0,
+        context_window_segments: Vec::new(),
         files_changed: 0,
         lines_added: 0,
         lines_removed: 0,

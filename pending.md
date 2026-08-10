@@ -58,3 +58,18 @@ Streaming is extra polish and a bigger, riskier change.
   (cheap mitigation: reserve placeholder height from the per-file numstat line count).
 - Don't regress file-watcher invalidation, staging, remote-repo serving, or the
   `load_duration` telemetry.
+
+---
+
+# CHORE: disk cleanup of build artifacts (do after the rlto build finishes)
+
+`target/` grows large during iteration (was 22 GB; the 529 GB incident is the cautionary tale).
+Recorded here so a session restart doesn't lose it.
+
+- [x] Deleted the stale `target/x86_64-pc-windows-msvc/` tree (old explicit-`--target` build, unused).
+- [x] Reclaimed the **debug** artifacts: `rm -rf target/debug` (done after the rlto build was
+      deployed to `WarpOss\` and relaunched; nothing was running from `target/debug`).
+- [ ] Optionally `cargo clean -p warp` to drop just the app crate's objects, keeping dep caches.
+- Always build with `CARGO_INCREMENTAL=0` (already doing this) to keep `target/` from ballooning.
+
+Do NOT `cargo clean` or delete `target/` while a build is running — it corrupts the in-progress build.

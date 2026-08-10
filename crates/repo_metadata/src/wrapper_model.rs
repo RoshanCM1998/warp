@@ -99,6 +99,7 @@ impl RepoMetadataModel {
 
     fn forward_local_event(
         &mut self,
+        _: ModelHandle<LocalRepoMetadataModel>,
         event: &RepositoryMetadataEvent,
         ctx: &mut ModelContext<Self>,
     ) {
@@ -149,6 +150,7 @@ impl RepoMetadataModel {
 
     fn forward_remote_event(
         &mut self,
+        _: ModelHandle<RemoteRepoMetadataModel>,
         event: &RemoteRepositoryMetadataEvent,
         ctx: &mut ModelContext<Self>,
     ) {
@@ -350,6 +352,23 @@ impl RepoMetadataModel {
         let dir_path = dir_path.clone();
         self.local.update(ctx, |local, ctx| {
             local.load_directory(&repo_root, &dir_path, ctx)
+        })
+    }
+
+    /// Loads a specific directory inside an already-tracked local tree and returns a future that
+    /// resolves once the async load has been applied or rejected.
+    #[cfg(feature = "local_fs")]
+    pub fn load_directory_with_completion(
+        &self,
+        repo_root: &StandardizedPath,
+        dir_path: &StandardizedPath,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<futures::future::BoxFuture<'static, Result<(), RepoMetadataError>>, RepoMetadataError>
+    {
+        let repo_root = repo_root.clone();
+        let dir_path = dir_path.clone();
+        self.local.update(ctx, |local, ctx| {
+            local.load_directory_with_completion(&repo_root, &dir_path, ctx)
         })
     }
 

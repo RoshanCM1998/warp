@@ -2,14 +2,16 @@
 #[cfg(test)]
 #[path = "layout_tests.rs"]
 mod tests;
-use ::local_control::protocol::TargetSelector;
+use ::local_control::protocol::{TabCreateParams, TabType, TargetSelector};
 use ::local_control::{ActionKind, ControlError, ErrorCode, InstanceId};
 use serde::Serialize;
 use warpui::{ModelContext, TypedActionView};
 
-use crate::local_control::resolver::{target_window_id_for_target, validate_tab_create_target};
 use crate::local_control::LocalControlBridge;
-use crate::workspace::{Workspace, WorkspaceAction};
+use crate::local_control::resolver::{
+    decode_params, target_window_id_for_target, validate_tab_create_target, workspace_for_window,
+};
+use crate::workspace::WorkspaceAction;
 #[derive(Serialize)]
 struct TabCreateResponse<'a> {
     action: &'static str,
@@ -33,31 +35,20 @@ struct TabCountsResponse {
     active_index: usize,
 }
 
-pub(crate) fn create_terminal_tab(
+pub(crate) fn create_tab(
     instance_id: &Option<InstanceId>,
+    params: &serde_json::Value,
     target: &TargetSelector,
     ctx: &mut ModelContext<LocalControlBridge>,
 ) -> Result<serde_json::Value, ControlError> {
     validate_tab_create_target(target)?;
     let window_id = target_window_id_for_target(ctx, target, ActionKind::TabCreate)?;
-    let workspace = ctx
-        .views_of_type::<Workspace>(window_id)
-        .and_then(|workspaces| workspaces.into_iter().next())
-        .ok_or_else(|| {
-            ControlError::new(
-                ErrorCode::MissingTarget,
-                "tab.create requires a workspace in the target window",
-            )
-        })?;
+    let workspace = workspace_for_window(window_id, ActionKind::TabCreate, ctx)?;
+    let action = tab_create_action(params)?;
     let (tab_id, previous_tab_count, tab_count, active_tab_index) =
         workspace.update(ctx, |workspace, ctx| {
             let previous_tab_count = workspace.tab_count();
-            workspace.handle_action(
-                &WorkspaceAction::AddTerminalTab {
-                    hide_homepage: false,
-                },
-                ctx,
-            );
+            workspace.handle_action(&action, ctx);
             let tab_id = workspace
                 .get_pane_group_view(workspace.active_tab_index())
                 .map(|tab| tab.id().to_string())
@@ -96,4 +87,19 @@ pub(crate) fn create_terminal_tab(
             err.to_string(),
         )
     })
+}
+
+fn tab_create_action(params: &serde_json::Value) -> Result<WorkspaceAction, ControlError> {
+    let params = decode_params::<TabCreateParams>(params)?;
+    match params.tab_type {
+        None | Some(TabType::Terminal) => Ok(WorkspaceAction::AddTerminalTab {
+            hide_homepage: false,
+        }),
+        Some(TabType::Agent) => Ok(WorkspaceAction::AddAgentTab),
+        Some(TabType::Default) => Ok(WorkspaceAction::AddDefaultTab),
+        Some(TabType::CloudAgent) => Err(ControlError::new(
+            ErrorCode::UnsupportedAction,
+            "tab.create does not support cloud-agent tabs",
+        )),
+    }
 }
