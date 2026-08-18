@@ -438,3 +438,52 @@ async fn num_lines_in_file_if_non_binary_errors_for_directory() {
     let result = LocalDiffStateModel::num_lines_in_file_if_non_binary(dir.path()).await;
     assert!(result.is_err());
 }
+
+#[test]
+fn build_hunk_patch_reconstructs_unified_diff() {
+    let hunk = DiffHunk {
+        old_start_line: 3,
+        old_line_count: 2,
+        new_start_line: 3,
+        new_line_count: 3,
+        unified_diff_start: 0,
+        unified_diff_end: 0,
+        lines: vec![
+            DiffLine {
+                line_type: DiffLineType::Context,
+                old_line_number: Some(3),
+                new_line_number: Some(3),
+                text: "fn main() {".into(),
+                no_trailing_newline: false,
+            },
+            DiffLine {
+                line_type: DiffLineType::Delete,
+                old_line_number: Some(4),
+                new_line_number: None,
+                text: "    old();".into(),
+                no_trailing_newline: false,
+            },
+            DiffLine {
+                line_type: DiffLineType::Add,
+                old_line_number: None,
+                new_line_number: Some(4),
+                text: "    new();".into(),
+                no_trailing_newline: false,
+            },
+            DiffLine {
+                line_type: DiffLineType::Add,
+                old_line_number: None,
+                new_line_number: Some(5),
+                text: "    extra();".into(),
+                no_trailing_newline: false,
+            },
+        ],
+    };
+
+    let patch = LocalDiffStateModel::build_hunk_patch("src/main.rs", &hunk);
+
+    assert_eq!(
+        patch,
+        "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -3,2 +3,3 @@\n fn main() {\n-    old();\n+    new();\n+    extra();\n"
+    );
+}

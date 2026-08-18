@@ -616,6 +616,14 @@ impl CodeEditorModel {
             buffer_version,
         )));
     }
+    /// Stops auto-hiding lines outside the active diff (and cancels any pending
+    /// recalculation), so explicitly expanded lines stay visible across later
+    /// diff updates. Used by the "expand entire file" affordance.
+    pub fn clear_hide_lines_outside_of_active_diff(&mut self) {
+        self.hide_lines_outside_of_active_diff = None;
+        self.recalculate_hidden_lines_after_diff = None;
+    }
+
     /// Requests hidden-line recalculation after a diff reaches `buffer_version`.
     fn request_hidden_lines_recalculation_after_diff(&mut self, buffer_version: BufferVersion) {
         self.recalculate_hidden_lines_after_diff = Some(

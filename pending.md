@@ -1,5 +1,13 @@
 # Pending: Progressive streaming for the code review panel
 
+> **2026-08-11 update:** the staging-latency half of this is DONE (second pass):
+> single-file stage/unstage now does a targeted per-path reload
+> (`reload_sections_for_path` → `FileSectionsUpdated` → `update_from_file_sections_result`)
+> instead of a full reload, and self-initiated `.git/index.lock` churn no longer
+> arms a redundant full invalidation. Progressive streaming of the INITIAL load
+> (below) remains open; its groundwork (`build_file_state` without list side
+> effects, `ListState::insert_at`) now exists.
+
 ## Status
 The **speed fix is done** (this commit): Head-mode diff loading now runs per-file
 diffs concurrently (bounded at 8) instead of one-at-a-time — see

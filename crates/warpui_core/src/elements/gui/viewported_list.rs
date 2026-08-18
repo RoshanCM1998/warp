@@ -92,6 +92,11 @@ impl<T> ListState<T> {
         self.0.borrow_mut().remove(index);
     }
 
+    /// Inserts a new (unmeasured) item at the given index, shifting later items down.
+    pub fn insert_at(&self, index: usize) {
+        self.0.borrow_mut().insert_at(index);
+    }
+
     pub fn scroll_to(&self, index: usize) {
         self.0.borrow_mut().scroll_to(index, None);
     }
@@ -708,6 +713,25 @@ impl<T> ListStateInner<T> {
         self.last_measured_index = self.last_measured_index.min(last_measured);
         if self.scroll_top.list_item_index.0 > index {
             self.scroll_top.list_item_index.0 -= 1;
+        }
+    }
+
+    fn insert_at(&mut self, index: usize) {
+        let (new_tree, last_measured) = {
+            let mut cursor = self.content.cursor::<Count, ()>();
+            let mut new_items = cursor.slice(&Count(index), sum_tree::SeekBias::Right);
+            // Everything after the insertion point needs re-measuring relative to
+            // the new item, so the last measured item is the one just before it.
+            let last_measured = new_items.summary().measured_count.saturating_sub(1);
+            new_items.push(ListItem { height: None });
+            new_items.push_tree(cursor.suffix());
+            (new_items, last_measured)
+        };
+
+        self.content = new_tree;
+        self.last_measured_index = self.last_measured_index.min(last_measured);
+        if self.scroll_top.list_item_index.0 >= index {
+            self.scroll_top.list_item_index.0 += 1;
         }
     }
 

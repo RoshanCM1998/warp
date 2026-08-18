@@ -142,6 +142,11 @@ struct FileInvalidationState {
     /// Whether a full invalidation is in-flight.
     /// When true, per-file invalidation requests are deferred to `pending_file_updates`.
     invalidate_all_pending: bool,
+    /// While set (and not yet expired), `index_lock_detected` watcher events are
+    /// ignored: a self-initiated stage/unstage churns `.git/index.lock`, and
+    /// reacting to it would arm a redundant full invalidation on top of the
+    /// operation's own targeted reload.
+    suppress_index_lock_until: Option<Instant>,
     /// Merge base commit for the current diff mode, computed eagerly during
     /// full invalidation.
     merge_base: Option<String>,
@@ -157,10 +162,18 @@ impl FileInvalidationState {
     fn new(queue: SyncQueue<FileInvalidationTask>) -> Self {
         Self {
             invalidate_all_pending: false,
+            suppress_index_lock_until: None,
             merge_base: None,
             merge_base_handle: None,
             queue,
         }
+    }
+
+    /// Whether a self-initiated index change (stage/unstage) is in progress, so
+    /// `index_lock_detected` events should be ignored.
+    fn index_lock_suppressed(&self) -> bool {
+        self.suppress_index_lock_until
+            .is_some_and(|until| Instant::now() < until)
     }
 
     fn cancel_all(&mut self) {
@@ -759,13 +772,14 @@ impl LocalDiffStateModel {
         };
 
         let mut renamed_file_infos = Vec::new();
+        let mut untracked_file_infos = Vec::new();
         let mut other_file_infos = Vec::new();
 
         for info in file_infos {
-            if matches!(info.status, GitFileStatus::Renamed { .. }) {
-                renamed_file_infos.push(info);
-            } else {
-                other_file_infos.push(info);
+            match info.status {
+                GitFileStatus::Renamed { .. } => renamed_file_infos.push(info),
+                GitFileStatus::Untracked => untracked_file_infos.push(info),
+                _ => other_file_infos.push(info),
             }
         }
 
@@ -834,9 +848,8 @@ impl LocalDiffStateModel {
             }
         }
 
-        // Handle other files normally
-        if !other_file_infos.is_empty() {
-            let relative_paths: Vec<String> = other_file_infos
+        let to_relative = |infos: &[FileStatusInfo]| -> Vec<String> {
+            infos
                 .iter()
                 .map(|info| {
                     info.path
@@ -844,11 +857,38 @@ impl LocalDiffStateModel {
                         .unwrap_or(info.path.as_str())
                         .to_string()
                 })
-                .collect();
+                .collect()
+        };
 
-            if branch == "HEAD" && should_stash {
+        if branch == "HEAD" && should_stash {
+            // One stash covers tracked and untracked alike: `stash push -u` both
+            // preserves untracked files and removes them from the worktree, and a
+            // single entry keeps the discard recoverable with one stash pop.
+            let mut relative_paths = to_relative(&untracked_file_infos);
+            relative_paths.extend(to_relative(&other_file_infos));
+            if !relative_paths.is_empty() {
                 Self::stash_uncommitted_changes(&repo_path, &relative_paths).await?;
-            } else {
+            }
+        } else {
+            // Untracked files have no committed state to restore — discarding one
+            // means deleting it. `git clean -fd` also removes untracked directory
+            // entries (e.g. nested repos) that `fs::remove_file` cannot. They must
+            // stay out of `git restore`'s pathspec below: one untracked path there
+            // fails the whole batch and shunts the tracked files into the
+            // `git rm -f` fallback.
+            let untracked_paths = to_relative(&untracked_file_infos);
+            if !untracked_paths.is_empty() {
+                let mut clean_args = vec!["clean", "-fd", "--"];
+                clean_args.extend(untracked_paths.iter().map(String::as_str));
+                log::debug!(
+                    "[GIT OPERATION] local.rs discard_files_impl git {}",
+                    clean_args.join(" ")
+                );
+                run_git_command(&repo_path, &clean_args).await?;
+            }
+
+            let relative_paths = to_relative(&other_file_infos);
+            if !relative_paths.is_empty() {
                 Self::git_restore_and_clean(&repo_path, &relative_paths, branch).await?;
             }
         }
@@ -904,7 +944,8 @@ impl LocalDiffStateModel {
     }
 
     /// Stage one or more files (`git add`). Index-only changes don't touch the worktree,
-    /// so the file watcher won't fire — we reload diffs/metadata explicitly on success
+    /// so the file watcher won't fire — we reload explicitly on success: a targeted
+    /// per-path reload for the interactive single-file case, a full reload otherwise
     /// (mirrors [`Self::discard_files`]).
     #[cfg(feature = "local_fs")]
     pub fn stage_files(&mut self, file_infos: Vec<FileStatusInfo>, ctx: &mut ModelContext<Self>) {
@@ -912,11 +953,16 @@ impl LocalDiffStateModel {
             return;
         };
         let repo_sp = current_repository.as_ref(ctx).root_dir().clone();
+        let single_target = self.single_staging_target(&repo_sp, &file_infos, ctx);
+        self.suppress_index_lock_events();
         ctx.spawn(
             async move { Self::stage_files_impl(&repo_sp, file_infos).await },
-            |me, result, ctx| match result {
+            move |me, result, ctx| match result {
                 Ok(_) => {
-                    me.load_diffs_for_current_repo(false, false, ctx);
+                    match single_target {
+                        Some(path) => me.reload_sections_for_path(path, ctx),
+                        None => me.load_diffs_for_current_repo(false, false, ctx),
+                    }
                     me.refresh_diff_metadata_for_current_repo(false, ctx);
                 }
                 Err(err) => {
@@ -931,19 +977,114 @@ impl LocalDiffStateModel {
         // Noop on WASM builds.
     }
 
+    /// Builds a minimal unified diff containing only `hunk`, applicable with
+    /// `git apply --cached` (stage) or `--cached -R` (unstage).
+    #[cfg(feature = "local_fs")]
+    fn build_hunk_patch(relative_path: &str, hunk: &DiffHunk) -> String {
+        let mut patch = format!(
+            "--- a/{relative_path}\n+++ b/{relative_path}\n@@ -{},{} +{},{} @@\n",
+            hunk.old_start_line, hunk.old_line_count, hunk.new_start_line, hunk.new_line_count
+        );
+        for line in &hunk.lines {
+            let prefix = match line.line_type {
+                DiffLineType::Context => ' ',
+                DiffLineType::Add => '+',
+                DiffLineType::Delete => '-',
+                DiffLineType::HunkHeader => continue,
+            };
+            patch.push(prefix);
+            patch.push_str(&line.text);
+            patch.push('\n');
+        }
+        patch
+    }
+
+    /// Stages or unstages a single hunk: writes a one-hunk patch to a temp file,
+    /// runs `git apply --cached [-R]`, then refreshes just this path's entries
+    /// via the targeted per-path reload.
+    #[cfg(feature = "local_fs")]
+    pub fn stage_hunk(
+        &mut self,
+        relative_path: String,
+        hunk: DiffHunk,
+        stage: bool,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(current_repository) = &self.repository else {
+            return;
+        };
+        let repo_path = current_repository
+            .as_ref(ctx)
+            .root_dir()
+            .to_local_path_lossy();
+        self.suppress_index_lock_events();
+        let path_for_reload = relative_path.clone();
+        ctx.spawn(
+            async move {
+                let patch = Self::build_hunk_patch(&relative_path, &hunk);
+                let patch_file = std::env::temp_dir().join(format!(
+                    "warp-hunk-{}-{}.patch",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|duration| duration.as_nanos())
+                        .unwrap_or_default()
+                ));
+                fs::write(&patch_file, patch)
+                    .map_err(|e| anyhow!("Failed to write hunk patch file: {e}"))?;
+                let mut args = vec!["apply", "--cached", "--whitespace=nowarn"];
+                if !stage {
+                    args.push("-R");
+                }
+                let patch_file_str = patch_file.to_string_lossy().into_owned();
+                args.push(patch_file_str.as_str());
+                log::debug!("[GIT OPERATION] local.rs stage_hunk git {}", args.join(" "));
+                let result = run_git_command(&repo_path, &args).await;
+                let _ = fs::remove_file(&patch_file);
+                result.map(|_| ())
+            },
+            move |me, result, ctx| match result {
+                Ok(()) => {
+                    me.reload_sections_for_path(path_for_reload, ctx);
+                    me.refresh_diff_metadata_for_current_repo(false, ctx);
+                }
+                Err(err) => {
+                    report_error!(err.context("Failed to stage/unstage hunk"));
+                }
+            },
+        );
+    }
+
+    #[cfg(not(feature = "local_fs"))]
+    pub fn stage_hunk(
+        &mut self,
+        _relative_path: String,
+        _hunk: DiffHunk,
+        _stage: bool,
+        _ctx: &mut ModelContext<Self>,
+    ) {
+        // Noop on WASM builds.
+    }
+
     /// Unstage one or more files (`git restore --staged`, falling back to `git rm --cached`
-    /// for repos without a HEAD commit). Reloads diffs/metadata explicitly on success.
+    /// for repos without a HEAD commit). Reloads explicitly on success — targeted for the
+    /// single-file case, full otherwise.
     #[cfg(feature = "local_fs")]
     pub fn unstage_files(&mut self, file_infos: Vec<FileStatusInfo>, ctx: &mut ModelContext<Self>) {
         let Some(current_repository) = &self.repository else {
             return;
         };
         let repo_sp = current_repository.as_ref(ctx).root_dir().clone();
+        let single_target = self.single_staging_target(&repo_sp, &file_infos, ctx);
+        self.suppress_index_lock_events();
         ctx.spawn(
             async move { Self::unstage_files_impl(&repo_sp, file_infos).await },
-            |me, result, ctx| match result {
+            move |me, result, ctx| match result {
                 Ok(_) => {
-                    me.load_diffs_for_current_repo(false, false, ctx);
+                    match single_target {
+                        Some(path) => me.reload_sections_for_path(path, ctx),
+                        None => me.load_diffs_for_current_repo(false, false, ctx),
+                    }
                     me.refresh_diff_metadata_for_current_repo(false, ctx);
                 }
                 Err(err) => {
@@ -984,6 +1125,172 @@ impl LocalDiffStateModel {
             paths.push(relative);
         }
         paths
+    }
+
+    /// When a stage/unstage affects exactly one non-renamed path and the staging
+    /// split is active, returns that repo-relative path so the caller can do a
+    /// targeted per-path reload instead of a full one. Renames are excluded — a
+    /// scoped `git status -- <new_path>` doesn't reliably surface the rename pair.
+    #[cfg(feature = "local_fs")]
+    fn single_staging_target(
+        &self,
+        repo_sp: &StandardizedPath,
+        file_infos: &[FileStatusInfo],
+        ctx: &ModelContext<Self>,
+    ) -> Option<String> {
+        let staging_split_active = matches!(self.mode, DiffMode::Head)
+            && FeatureFlag::CodeReviewStaging.is_enabled()
+            && *crate::settings::CodeSettings::as_ref(ctx).staging_area;
+        if !staging_split_active || file_infos.len() != 1 {
+            return None;
+        }
+        let info = &file_infos[0];
+        if matches!(info.status, GitFileStatus::Renamed { .. }) {
+            return None;
+        }
+        Some(
+            info.path
+                .strip_prefix(repo_sp)
+                .unwrap_or(info.path.as_str())
+                .to_string(),
+        )
+    }
+
+    /// Arms a short window during which `index_lock_detected` watcher events are
+    /// ignored (see `FileInvalidationState::suppress_index_lock_until`). The window
+    /// out-lives the lock churn of a single `git add`/`git restore --staged` and
+    /// expires on its own, so a hung operation can't wedge watcher handling.
+    #[cfg(feature = "local_fs")]
+    fn suppress_index_lock_events(&mut self) {
+        self.file_invalidation.suppress_index_lock_until =
+            Some(Instant::now() + std::time::Duration::from_secs(2));
+    }
+
+    /// Recomputes the staged/unstaged entries for a single path and emits
+    /// [`DiffStateModelEvent::FileSectionsUpdated`] with the replacement set —
+    /// ≤6 git invocations instead of the 2N+2 of a full split reload. Falls back
+    /// to a full reload on error.
+    #[cfg(feature = "local_fs")]
+    fn reload_sections_for_path(&mut self, relative: String, ctx: &mut ModelContext<Self>) {
+        let Some(current_repository) = &self.repository else {
+            return;
+        };
+        let repo_path = current_repository
+            .as_ref(ctx)
+            .root_dir()
+            .to_local_path_lossy();
+        let path_for_result = relative.clone();
+        ctx.spawn(
+            async move { Self::retrieve_sections_for_path(&repo_path, &relative).await },
+            move |me, result, ctx| match result {
+                Ok(files) => {
+                    me.patch_cached_diffs_for_path(&path_for_result, &files);
+                    let files = files.into_iter().map(Arc::new).collect();
+                    ctx.emit(DiffStateModelEvent::FileSectionsUpdated {
+                        path: path_for_result,
+                        files,
+                    });
+                }
+                Err(err) => {
+                    log::warn!(
+                        "Targeted section reload failed for {path_for_result}: {err}; \
+                         falling back to a full reload"
+                    );
+                    me.load_diffs_for_current_repo(false, false, ctx);
+                }
+            },
+        );
+    }
+
+    /// Loads the staged/unstaged [`FileDiffAndContent`] entries for one path — the
+    /// per-path equivalent of [`Self::diff_state_against_head_split`]'s per-entry
+    /// block, sharing the same section helpers.
+    #[cfg(feature = "local_fs")]
+    async fn retrieve_sections_for_path(
+        repo_path: &Path,
+        relative: &str,
+    ) -> Result<Vec<FileDiffAndContent>> {
+        log::debug!(
+            "[GIT OPERATION] local.rs retrieve_sections_for_path git status -- {relative}"
+        );
+        let status_output = run_git_command(
+            repo_path,
+            &[
+                "--no-optional-locks",
+                "status",
+                "--untracked-files=all",
+                "--porcelain=2",
+                "-z",
+                "--",
+                relative,
+            ],
+        )
+        .await?;
+        let (staged, unstaged) = Self::parse_git_status_split(&status_output)?;
+        let is_binary = Self::is_file_binary(repo_path, relative, "HEAD")
+            .await
+            .unwrap_or(false);
+
+        let entries = staged
+            .into_iter()
+            .map(|(path, status)| (StagingSection::Staged, path, status))
+            .chain(
+                unstaged
+                    .into_iter()
+                    .map(|(path, status)| (StagingSection::Unstaged, path, status)),
+            );
+
+        let mut files = Vec::new();
+        for (section, file_path, status) in entries {
+            let mut file_diff = Self::get_file_diff_for_section(
+                repo_path, &file_path, &status, is_binary, section,
+            )
+            .await?;
+            // Never read or ship base content for binary files: it can't be
+            // inline-rendered and, after lossy UTF-8 decoding, can balloon ~3x.
+            let content = if is_binary {
+                None
+            } else {
+                Self::get_file_content_for_section(repo_path, &file_path, &status, section).await
+            };
+            file_diff.is_autogenerated = is_file_autogenerated(&file_path, content.as_deref());
+            files.push(FileDiffAndContent {
+                file_diff,
+                content_at_head: content,
+            });
+        }
+        Ok(files)
+    }
+
+    /// Keeps the model's cached [`GitDiffData`] coherent after a targeted per-path
+    /// reload: entries for `path` are replaced (staged entries stay grouped before
+    /// unstaged ones, matching loader order) and the totals are recomputed.
+    #[cfg(feature = "local_fs")]
+    fn patch_cached_diffs_for_path(&mut self, path: &str, files: &[FileDiffAndContent]) {
+        let InternalDiffState::Loaded(diffs) = &mut self.state else {
+            return;
+        };
+        let Ok(data) = &mut diffs.changes else {
+            return;
+        };
+        data.files.retain(|file| file.file_path != path);
+        for entry in files {
+            let file_diff = entry.file_diff.clone();
+            match file_diff.staging_section {
+                StagingSection::Staged => {
+                    let insert_at = data
+                        .files
+                        .iter()
+                        .position(|f| f.staging_section == StagingSection::Unstaged)
+                        .unwrap_or(data.files.len());
+                    data.files.insert(insert_at, file_diff);
+                }
+                StagingSection::Unstaged => data.files.push(file_diff),
+            }
+        }
+        data.files_changed = data.files.len();
+        data.total_additions = data.files.iter().map(|f| f.additions()).sum();
+        data.total_deletions = data.files.iter().map(|f| f.deletions()).sum();
     }
 
     #[cfg(feature = "local_fs")]
@@ -1213,6 +1520,11 @@ impl LocalDiffStateModel {
             // MetadataRefreshed with fresh stats/git-operations data.
             return true;
         } else if index_lock_detected {
+            if self.file_invalidation.index_lock_suppressed() {
+                // Our own stage/unstage is churning the index; its completion
+                // callback performs the (targeted) reload.
+                return false;
+            }
             if self.file_invalidation.invalidate_all_pending {
                 // Lock was released while a full invalidation was pending — reload now.
                 self.load_diffs_for_current_repo(false, false, ctx);

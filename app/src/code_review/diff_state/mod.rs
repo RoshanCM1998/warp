@@ -408,6 +408,15 @@ pub enum DiffStateModelEvent {
         path: String,
         diff: Option<Arc<FileDiffAndContent>>,
     },
+    /// Replacement set of staging-section entries for one path after a
+    /// stage/unstage: a partially-staged file yields two entries (staged +
+    /// unstaged), a fully staged or unstaged file yields one, and an empty set
+    /// means the file left the diff entirely.
+    FileSectionsUpdated {
+        /// Repo-relative path whose entries are being replaced.
+        path: String,
+        files: Vec<Arc<FileDiffAndContent>>,
+    },
     /// Event dispatched when diff metadata (stats, branch info) is refreshed.
     MetadataRefreshed(Box<DiffMetadata>),
     /// The remote connection was lost. Stale diffs should be preserved while
@@ -512,6 +521,12 @@ impl DiffStateModel {
                 ctx.emit(DiffStateModelEvent::SingleFileUpdated {
                     path: path.clone(),
                     diff: diff.clone(),
+                });
+            }
+            DiffStateModelEvent::FileSectionsUpdated { path, files } => {
+                ctx.emit(DiffStateModelEvent::FileSectionsUpdated {
+                    path: path.clone(),
+                    files: files.clone(),
                 });
             }
             DiffStateModelEvent::MetadataRefreshed(metadata) => {
@@ -775,6 +790,26 @@ impl DiffStateModel {
             Self::Local(local) => {
                 local.update(ctx, |local, ctx| {
                     local.stage_files(file_infos, ctx);
+                });
+            }
+            Self::Remote(_) => {}
+        }
+    }
+
+    /// Stage (`stage == true`) or unstage a single diff hunk in the git index.
+    /// Local-only; the remote backend is a no-op (the staging area is a
+    /// local-only, Head-mode feature).
+    pub(crate) fn stage_hunk(
+        &self,
+        relative_path: String,
+        hunk: DiffHunk,
+        stage: bool,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        match self {
+            Self::Local(local) => {
+                local.update(ctx, |local, ctx| {
+                    local.stage_hunk(relative_path, hunk, stage, ctx);
                 });
             }
             Self::Remote(_) => {}

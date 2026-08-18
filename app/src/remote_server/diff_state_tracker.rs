@@ -380,6 +380,10 @@ impl RemoteDiffStateManager {
             | DiffStateModelEvent::BranchCommittedFilesReceived(_) => {
                 // Client-only events don't go through this tracker.
             }
+            DiffStateModelEvent::FileSectionsUpdated { .. } => {
+                // Staging is a local-only feature (the remote backend's
+                // stage/unstage is a no-op), so this never fires server-side.
+            }
         }
     }
 

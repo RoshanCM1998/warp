@@ -77,7 +77,7 @@ use crate::code::editor::line::EditorLineLocation;
 use crate::code::editor::view::{CodeEditorEvent, CodeEditorRenderOptions, CodeEditorView};
 use crate::code::editor::{
     CommentEditor, CommentEditorEvent, EditorCommentsModel, EditorReviewComment, GutterHoverTarget,
-    add_color, remove_color,
+    StageHunkKind, add_color, remove_color,
 };
 use crate::code::editor_management::CodeEditorStatus;
 use crate::code::footer::{CodeFooterView, CodeFooterViewEvent};
@@ -261,6 +261,8 @@ const EDITOR_GAP: f32 = 12.;
 /// fallback for the sticky-header offset before the header has been measured. If the
 /// header styling changes substantially, update this value.
 const STAGING_SECTION_HEADER_HEIGHT: f32 = 36.;
+/// Same role as [`STAGING_SECTION_HEADER_HEIGHT`], for the directory group header.
+const DIR_GROUP_HEADER_HEIGHT: f32 = 26.;
 const FILE_SIDEBAR_PANE_WIDTH_PERCENTAGE: f32 = 0.25;
 /// Vertical gap between the right panel header row and the code review content below it
 /// (sub-header in loaded state, loading text in loading state).
@@ -327,6 +329,9 @@ pub enum CodeReviewAction {
         line_and_column: Option<LineAndColumnArg>,
     },
     ToggleFileExpanded(String),
+    /// Reveal every hidden (unchanged) section of a file's diff so the whole file
+    /// is visible, GitHub-style. `String` is the file-state key.
+    ExpandEntireFile(String),
     ExpandAllFiles,
     CollapseAllFiles,
     OpenHeaderMenu,
@@ -372,6 +377,9 @@ pub enum CodeReviewAction {
     ToggleStagedSectionCollapsed,
     /// Collapse/expand the "Changes" section in the file sidebar.
     ToggleUnstagedSectionCollapsed,
+    /// Collapse/expand a directory group in the file sidebar. `String` is the
+    /// group's `sidebar_dir_key`.
+    ToggleSidebarDirCollapsed(String),
     SubmitReviewComments,
 }
 
@@ -383,6 +391,9 @@ pub struct FileState {
     header_mouse_state: MouseStateHandle,
     chevron_button: ViewHandle<ActionButton>,
     open_in_tab_button: ViewHandle<ActionButton>,
+    /// Reveals every hidden (unchanged) section of the file's diff (GitHub-style
+    /// "expand full file").
+    expand_file_button: ViewHandle<ActionButton>,
     discard_button: ViewHandle<ActionButton>,
     add_context_button: ViewHandle<ActionButton>,
     copy_path_button: ViewHandle<ActionButton>,
@@ -398,6 +409,10 @@ pub(crate) struct LoadedState {
     pub(crate) total_additions: usize,
     pub(crate) total_deletions: usize,
     pub(crate) files_changed: usize,
+    /// Hover state for each sidebar directory group header, keyed by
+    /// [`CodeReviewView::sidebar_dir_key`]. Built alongside `file_states` because
+    /// hover handles must persist across frames to work.
+    pub(crate) sidebar_dir_mouse_states: HashMap<String, MouseStateHandle>,
 }
 
 impl LoadedState {
@@ -558,8 +573,15 @@ struct RepositoryState {
     state: CodeReviewViewState,
     available_branches: Vec<BranchEntry>,
 
-    /// Whether a repo-relative file path has been explicitly expanded (true) or collapsed (false).
+    /// Whether a file has been explicitly expanded (true) or collapsed (false),
+    /// keyed by [`CodeReviewView::file_state_key`] so a partially-staged file
+    /// keeps independent expansion per section.
     file_expanded: HashMap<String, bool>,
+
+    /// Sidebar directory groups the user collapsed, keyed by
+    /// [`CodeReviewView::sidebar_dir_key`]. Lives here so collapse state
+    /// survives diff reloads.
+    collapsed_sidebar_dirs: HashSet<String>,
 }
 
 impl RepositoryState {
@@ -569,6 +591,7 @@ impl RepositoryState {
             state: CodeReviewViewState::None,
             available_branches: Vec::new(),
             file_expanded: HashMap::new(),
+            collapsed_sidebar_dirs: HashSet::new(),
         }
     }
 
@@ -589,7 +612,10 @@ impl RepositoryState {
     }
 
     fn should_auto_expand_file(&self, file: &FileDiff) -> bool {
-        if let Some(manually_expanded) = self.file_expanded.get(&file.file_path) {
+        if let Some(manually_expanded) = self
+            .file_expanded
+            .get(&CodeReviewView::file_state_key(file))
+        {
             return *manually_expanded;
         }
 
@@ -736,8 +762,59 @@ impl CodeReviewView {
     fn file_state_key(file_diff: &FileDiff) -> String {
         match file_diff.staging_section {
             StagingSection::Unstaged => file_diff.file_path.clone(),
-            StagingSection::Staged => format!("\u{1}staged\u{1}{}", file_diff.file_path),
+            StagingSection::Staged => Self::staged_state_key(&file_diff.file_path),
         }
+    }
+
+    /// Inverse of [`Self::file_state_key`]: strips the staged-section sentinel so the
+    /// key can be used wherever a plain repo-relative path is expected (display,
+    /// path resolution, status lookups).
+    fn bare_path_from_state_key(key: &str) -> &str {
+        key.strip_prefix("\u{1}staged\u{1}").unwrap_or(key)
+    }
+
+    /// The [`Self::file_state_key`] a repo-relative path will have once it lands in
+    /// the Staged section. Used to seed state (e.g. collapse-on-stage) for an entry
+    /// that only exists after the post-stage reload.
+    fn staged_state_key(path: &str) -> String {
+        format!("\u{1}staged\u{1}{path}")
+    }
+
+    /// The directory a file is grouped under in the sidebar: its repo-relative
+    /// parent path, or `""` for files at the repo root.
+    fn sidebar_dir_of(path: &str) -> &str {
+        Path::new(path)
+            .parent()
+            .and_then(|parent| parent.to_str())
+            .unwrap_or("")
+    }
+
+    /// Key identifying a sidebar directory group. Includes the staging section so
+    /// the same directory collapses independently in Staged vs Changes.
+    fn sidebar_dir_key(file_diff: &FileDiff) -> String {
+        let section = match file_diff.staging_section {
+            StagingSection::Staged => "staged",
+            StagingSection::Unstaged => "unstaged",
+        };
+        format!("{section}:{}", Self::sidebar_dir_of(&file_diff.file_path))
+    }
+
+    /// Display-order key that groups files by directory: staged block first, then
+    /// directories alphabetically with root files last, then file name. Both the
+    /// sidebar and the main list's directory headers rely on files sorted this way
+    /// (directory runs must be contiguous).
+    fn file_group_order(file_diff: &FileDiff) -> (u8, bool, String, String) {
+        let section = match file_diff.staging_section {
+            StagingSection::Staged => 0u8,
+            StagingSection::Unstaged => 1u8,
+        };
+        let dir = Self::sidebar_dir_of(&file_diff.file_path).to_string();
+        let name = Path::new(&file_diff.file_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&file_diff.file_path)
+            .to_string();
+        (section, dir.is_empty(), dir, name)
     }
 
     /// Whether the staging-area UI (Staged / Changes sections) is active: the feature flag
@@ -2446,6 +2523,12 @@ impl CodeReviewView {
                     self.update_git_operations_ui(ctx);
                 }
             }
+            DiffStateModelEvent::FileSectionsUpdated { path, files } => {
+                self.update_from_file_sections_result(path, files, ctx);
+                if FeatureFlag::GitOperationsInCodeReview.is_enabled() {
+                    self.update_git_operations_ui(ctx);
+                }
+            }
             DiffStateModelEvent::MetadataRefreshed(metadata) => {
                 let mode = self.diff_state_model.as_ref(ctx).diff_mode(ctx);
                 if let Some(CodeReviewViewState::Loaded(loaded_state)) = self.state_mut() {
@@ -2655,9 +2738,19 @@ impl CodeReviewView {
         // Create a new list state for this update
         self.viewported_list_state = Self::create_list_state(ctx);
 
-        let file_states_vec = self.build_view_state_for_file_diffs(&diff_data.files, ctx);
+        let mut file_states_vec = self.build_view_state_for_file_diffs(&diff_data.files, ctx);
+        // Directory-group order (staged first, dirs alphabetical, root last) — the
+        // sidebar and main-list group headers require contiguous directory runs.
+        file_states_vec.sort_by_key(|fs| Self::file_group_order(&fs.file_diff));
         let is_local = self.repo_is_local();
         let diff_mode = self.diff_state_model.as_ref(ctx).diff_mode(ctx);
+
+        let mut sidebar_dir_mouse_states = HashMap::new();
+        for fs in &file_states_vec {
+            sidebar_dir_mouse_states
+                .entry(Self::sidebar_dir_key(&fs.file_diff))
+                .or_insert_with(MouseStateHandle::default);
+        }
 
         if let Some(repo) = self.active_repo.as_mut() {
             repo.state = CodeReviewViewState::Loaded(LoadedState {
@@ -2665,6 +2758,7 @@ impl CodeReviewView {
                     .into_iter()
                     .map(|fs| (Self::file_state_key(&fs.file_diff), fs))
                     .collect(),
+                sidebar_dir_mouse_states,
                 total_additions: diff_data.total_additions,
                 total_deletions: diff_data.total_deletions,
                 files_changed: diff_data.files_changed,
@@ -2704,6 +2798,21 @@ impl CodeReviewView {
         files: &[FileDiffAndContent],
         ctx: &mut ViewContext<Self>,
     ) -> Vec<FileState> {
+        let mut file_states = vec![];
+        for file in files {
+            file_states.push(self.build_file_state(file, ctx));
+        }
+
+        // Populate the viewported list with file diffs
+        for _ in file_states.iter() {
+            self.viewported_list_state.add_item();
+        }
+        file_states
+    }
+
+    /// Builds the complete view state (editor, buttons, expansion) for one file.
+    /// Does NOT touch `viewported_list_state` — callers manage list slots.
+    fn build_file_state(&self, file: &FileDiffAndContent, ctx: &mut ViewContext<Self>) -> FileState {
         let git_operation_blocked = self
             .diff_state_model
             .as_ref(ctx)
@@ -2714,8 +2823,7 @@ impl CodeReviewView {
             "Discard changes".to_string()
         };
 
-        let mut file_states = vec![];
-        for file in files {
+        {
             let editor_state = {
                 // `LocalCodeEditorView::new_with_global_buffer` natively
                 // supports both `LocalOrRemotePath::Local` and `Remote`
@@ -2774,8 +2882,29 @@ impl CodeReviewView {
                     })
             });
 
+            let expand_file_path = Self::file_state_key(&file.file_diff);
+            let expand_file_button = ctx.add_typed_action_view(move |_ctx| {
+                ActionButton::new("", NakedTheme)
+                    .with_icon(Icon::ExpandUpAndDown)
+                    .with_size(ButtonSize::InlineActionHeader)
+                    .with_tooltip("Expand full file")
+                    .on_click(move |ctx| {
+                        ctx.dispatch_typed_action(CodeReviewAction::ExpandEntireFile(
+                            expand_file_path.clone(),
+                        ))
+                    })
+            });
+
             let discard_path = file.file_diff.file_path.clone();
-            let discard_tooltip = discard_tooltip_text.clone();
+            // Untracked files can't be restored — discarding one deletes it, so the
+            // affordance must say so.
+            let discard_tooltip = if !git_operation_blocked
+                && matches!(file.file_diff.status, GitFileStatus::Untracked)
+            {
+                "Delete file".to_string()
+            } else {
+                discard_tooltip_text.clone()
+            };
             let discard_button = ctx.add_typed_action_view(move |ctx| {
                 let mut button = ActionButton::new("", NakedTheme)
                     .with_icon(Icon::ReverseLeft)
@@ -2840,26 +2969,104 @@ impl CodeReviewView {
                     })
             });
 
-            file_states.push(FileState {
+            FileState {
                 file_diff: file.file_diff.clone(),
                 editor_state,
                 is_expanded,
                 chevron_button,
                 open_in_tab_button,
+                expand_file_button,
                 discard_button,
                 add_context_button,
                 copy_path_button,
                 stage_unstage_button,
                 sidebar_mouse_state: MouseStateHandle::default(),
                 header_mouse_state: MouseStateHandle::default(),
-            })
+            }
+        }
+    }
+
+    /// Applies a [`DiffStateModelEvent::FileSectionsUpdated`] replacement set:
+    /// removes every entry for `path` (both section keys) and inserts the new
+    /// entries at their section-correct positions — staged entries at the end of
+    /// the staged block, unstaged at the end — leaving every other row's state
+    /// (editors, scroll, expansion) untouched. This is what keeps a single-file
+    /// stage/unstage cheap compared to the full-reload path.
+    fn update_from_file_sections_result(
+        &mut self,
+        path: &str,
+        files: &[Arc<FileDiffAndContent>],
+        ctx: &mut ViewContext<Self>,
+    ) {
+        // Build the replacement states first — needs `&self` before the
+        // `&mut` borrow of the repo state below.
+        let new_states: Vec<FileState> = files
+            .iter()
+            .map(|file| self.build_file_state(file.as_ref(), ctx))
+            .collect();
+
+        let staged_key = Self::staged_state_key(path);
+
+        let Some(repo) = self.active_repo.as_mut() else {
+            return;
+        };
+        let CodeReviewViewState::Loaded(state) = &mut repo.state else {
+            return;
+        };
+
+        let mut min_touched = usize::MAX;
+
+        // Remove existing entries for the path, highest index first so earlier
+        // indices stay valid.
+        let mut existing: Vec<usize> = [staged_key.as_str(), path]
+            .iter()
+            .filter_map(|key| state.file_states.get_index_of(*key))
+            .collect();
+        existing.sort_unstable_by(|a, b| b.cmp(a));
+        for index in existing {
+            state.file_states.shift_remove_index(index);
+            self.viewported_list_state.remove(index);
+            min_touched = min_touched.min(index);
         }
 
-        // Populate the viewported list with file diffs
-        for _ in file_states.iter() {
-            self.viewported_list_state.add_item();
+        for file_state in new_states {
+            let key = Self::file_state_key(&file_state.file_diff);
+            // Seed hover state for a directory group that didn't exist before.
+            state
+                .sidebar_dir_mouse_states
+                .entry(Self::sidebar_dir_key(&file_state.file_diff))
+                .or_insert_with(MouseStateHandle::default);
+            // Keep the directory-group sort invariant (see `file_group_order`).
+            let order = Self::file_group_order(&file_state.file_diff);
+            let insert_at = state
+                .file_states
+                .values()
+                .position(|fs| Self::file_group_order(&fs.file_diff) > order)
+                .unwrap_or(state.file_states.len());
+            state.file_states.shift_insert(insert_at, key, file_state);
+            self.viewported_list_state.insert_at(insert_at);
+            min_touched = min_touched.min(insert_at);
         }
-        file_states
+
+        state.files_changed = state.file_states.len();
+        state.total_additions = state
+            .file_states
+            .values()
+            .map(|fs| fs.file_diff.additions())
+            .sum();
+        state.total_deletions = state
+            .file_states
+            .values()
+            .map(|fs| fs.file_diff.deletions())
+            .sum();
+
+        // Indices at and after the first touched position shifted; re-measure them.
+        if min_touched != usize::MAX {
+            for index in min_touched..state.file_states.len() {
+                self.viewported_list_state.invalidate_height_for_index(index);
+            }
+        }
+        ctx.notify();
     }
 
     fn render_diff_at_index(
@@ -3185,13 +3392,14 @@ impl CodeReviewView {
                                 ctx,
                             )
                             .with_add_context_button() // Enable add context button for code review
-                            .with_revert_diff_hunk_button() // Enable revert diff button for code review
                             .with_comment_button() // Enable comment button for code review
                             .with_collapsible_diffs(false) // Disable collapsible diffs
                             .disable_diff_indicator_expansion_on_hover()
                             .with_gutter_hover_target(GutterHoverTarget::Line) // Show gutter element when hovering the line.
                             .disable_find_and_replace(); // Disable find and replace since parts of the file are hidden from view
 
+                            editor_view =
+                                self.add_hunk_staging_buttons(editor_view, &file.file_diff, ctx);
                             editor_view.set_show_nav_bar(false);
 
                             // Now we hand off hidden lines calculation to the editor model itself.
@@ -3265,13 +3473,13 @@ impl CodeReviewView {
                     ctx,
                 )
                 .with_add_context_button() // Enable add context button for code review
-                .with_revert_diff_hunk_button() // Enable revert diff button for code review
                 .with_comment_button() // Enable comment button for code review
                 .with_collapsible_diffs(false) // Disable collapsible diffs
                 .disable_diff_indicator_expansion_on_hover()
                 .with_gutter_hover_target(GutterHoverTarget::Line) // Show gutter element when hovering the line.
                 .disable_find_and_replace(); // Disable find and replace since parts of the file are hidden from view
 
+                editor_view = self.add_hunk_staging_buttons(editor_view, &file.file_diff, ctx);
                 editor_view.set_show_nav_bar(false);
                 editor_view
             });
@@ -4936,11 +5144,7 @@ impl CodeReviewView {
                 None,
             ));
             if !self.staged_section_collapsed {
-                for (index, file_state) in staged {
-                    column.add_child(
-                        self.render_sidebar_file_entry(index, file_state, appearance, true),
-                    );
-                }
+                self.add_grouped_sidebar_entries(&mut column, staged, state, appearance, true);
             }
 
             column.add_child(self.render_staging_section_header(
@@ -4953,18 +5157,12 @@ impl CodeReviewView {
                 None,
             ));
             if !self.unstaged_section_collapsed {
-                for (index, file_state) in unstaged {
-                    column.add_child(
-                        self.render_sidebar_file_entry(index, file_state, appearance, true),
-                    );
-                }
+                self.add_grouped_sidebar_entries(&mut column, unstaged, state, appearance, true);
             }
         } else {
-            for (file_index, file_state) in state.file_states.values().enumerate() {
-                column.add_child(
-                    self.render_sidebar_file_entry(file_index, file_state, appearance, false),
-                );
-            }
+            let entries: Vec<(usize, &FileState)> =
+                state.file_states.values().enumerate().collect();
+            self.add_grouped_sidebar_entries(&mut column, entries, state, appearance, false);
         }
 
         let scrollable_content = NewScrollable::vertical(
@@ -5010,6 +5208,170 @@ impl CodeReviewView {
         (FILE_SIDEBAR_MIN_WIDTH, FILE_SIDEBAR_MAX_WIDTH)
     }
 
+    /// Groups `entries` by parent directory (first-appearance order) and appends a
+    /// collapsible directory header followed by that directory's file rows.
+    fn add_grouped_sidebar_entries<'a>(
+        &self,
+        column: &mut Flex,
+        entries: Vec<(usize, &'a FileState)>,
+        state: &LoadedState,
+        appearance: &Appearance,
+        show_staging_button: bool,
+    ) {
+        let Some(repo) = self.active_repo.as_ref() else {
+            return;
+        };
+
+        // Order-preserving grouping: directories appear in the order the loader
+        // emitted their first file; files keep their relative order within a group.
+        let mut groups: Vec<(String, Vec<(usize, &FileState)>)> = Vec::new();
+        for (index, file_state) in entries {
+            let dir = Self::sidebar_dir_of(&file_state.file_diff.file_path).to_string();
+            match groups.last_mut() {
+                Some((last_dir, group)) if *last_dir == dir => group.push((index, file_state)),
+                _ => {
+                    if let Some((_, group)) =
+                        groups.iter_mut().find(|(group_dir, _)| *group_dir == dir)
+                    {
+                        group.push((index, file_state));
+                    } else {
+                        groups.push((dir, vec![(index, file_state)]));
+                    }
+                }
+            }
+        }
+
+        for (dir, group) in groups {
+            let Some((_, first)) = group.first() else {
+                continue;
+            };
+            let key = Self::sidebar_dir_key(&first.file_diff);
+            let collapsed = repo.collapsed_sidebar_dirs.contains(&key);
+            let mouse_state = state
+                .sidebar_dir_mouse_states
+                .get(&key)
+                .cloned()
+                .unwrap_or_default();
+            column.add_child(self.render_sidebar_dir_header(
+                &dir,
+                group.len(),
+                collapsed,
+                key,
+                mouse_state,
+                appearance,
+            ));
+            if collapsed {
+                continue;
+            }
+            for (index, file_state) in group {
+                column.add_child(self.render_sidebar_file_entry(
+                    index,
+                    file_state,
+                    appearance,
+                    show_staging_button,
+                ));
+            }
+        }
+    }
+
+    /// Renders a collapsible sidebar directory header: chevron + directory path +
+    /// file count. Root files group under "(root)".
+    fn render_sidebar_dir_header(
+        &self,
+        dir: &str,
+        count: usize,
+        collapsed: bool,
+        key: String,
+        mouse_state: MouseStateHandle,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let chevron = if collapsed {
+            Icon::ChevronRight
+        } else {
+            Icon::ChevronDown
+        };
+        let muted = theme.sub_text_color(theme.surface_2());
+        let label = if dir.is_empty() {
+            "(root)".to_string()
+        } else {
+            format!("{dir}/")
+        };
+
+        // Same visual language as `render_staging_section_header`: chevron +
+        // label + compact count pill, just one visual level below it.
+        let mut row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+        row.add_child(
+            Container::new(
+                ConstrainedBox::new(
+                    chevron
+                        .to_warpui_icon(warp_core::ui::theme::Fill::Solid(muted.into()))
+                        .finish(),
+                )
+                .with_width(12.)
+                .with_height(12.)
+                .finish(),
+            )
+            .with_margin_right(8.)
+            .finish(),
+        );
+        row.add_child(
+            Shrinkable::new(
+                1.,
+                Text::new(
+                    label,
+                    appearance.ui_font_family(),
+                    appearance.ui_font_size() - 1.,
+                )
+                .with_color(muted.into())
+                .with_clip(ClipConfig::end())
+                .soft_wrap(false)
+                .finish(),
+            )
+            .finish(),
+        );
+        row.add_child(
+            Container::new(
+                Text::new(
+                    count.to_string(),
+                    appearance.ui_font_family(),
+                    appearance.ui_font_size() - 2.,
+                )
+                .with_color(muted.into())
+                .soft_wrap(false)
+                .finish(),
+            )
+            .with_horizontal_padding(6.)
+            .with_vertical_padding(1.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(9.)))
+            .with_background(warp_core::ui::theme::Fill::Solid(internal_colors::neutral_3(
+                theme,
+            )))
+            .with_margin_left(8.)
+            .finish(),
+        );
+
+        Hoverable::new(mouse_state, |mouse_state| {
+            let mut container = Container::new(row.finish())
+                .with_padding_top(10.)
+                .with_padding_bottom(6.)
+                .with_padding_left(16.)
+                .with_padding_right(8.)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)));
+            if mouse_state.is_hovered() {
+                container = container.with_background(warp_core::ui::theme::Fill::Solid(
+                    internal_colors::neutral_2(appearance.theme()),
+                ));
+            }
+            container.finish()
+        })
+        .on_click(move |ctx, _, _| {
+            ctx.dispatch_typed_action(CodeReviewAction::ToggleSidebarDirCollapsed(key.clone()));
+        })
+        .with_cursor(Cursor::PointingHand)
+        .finish()
+    }
+
     /// Wraps a single sidebar file row in the hoverable, click-to-select container.
     /// `file_index` is the global index into `file_states` (used by `FileSelected`).
     fn render_sidebar_file_entry(
@@ -5023,7 +5385,8 @@ impl CodeReviewView {
         Hoverable::new(file_state.sidebar_mouse_state.clone(), |mouse_state| {
             let mut container = Container::new(Shrinkable::new(1., file_row).finish())
                 .with_vertical_padding(5.)
-                .with_horizontal_padding(8.)
+                .with_padding_left(24.)
+                .with_padding_right(8.)
                 .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)));
 
             if mouse_state.is_hovered() {
@@ -5156,10 +5519,6 @@ impl CodeReviewView {
             .file_name()
             .and_then(|file_name| file_name.to_str())
             .unwrap_or_default();
-        let dir_path = repo_relative_path
-            .parent()
-            .and_then(|parent| parent.to_str())
-            .unwrap_or_default();
         let additions = file_state.file_diff.additions();
         let deletions = file_state.file_diff.deletions();
 
@@ -5197,41 +5556,8 @@ impl CodeReviewView {
             .finish(),
         );
 
-        // Directory path (muted and smaller)
-        if !dir_path.is_empty() {
-            file_and_directory.add_child(
-                Shrinkable::new(
-                    1.,
-                    Text::new(
-                        dir_path.to_string(),
-                        appearance.ui_font_family(),
-                        appearance.ui_font_size() * SMALLER_TEXT_RATIO, // Slightly smaller
-                    )
-                    .with_color(
-                        appearance
-                            .theme()
-                            .sub_text_color(appearance.theme().surface_2())
-                            .into(),
-                    )
-                    .with_clip(ClipConfig::end())
-                    .soft_wrap(false)
-                    .with_line_height_ratio(DEFAULT_UI_LINE_HEIGHT_RATIO / SMALLER_TEXT_RATIO)
-                    .with_compute_baseline_position_fn(Box::new(|args| {
-                        // Calculate baseline position as if we were using the larger font size.
-                        // This ensures both text elements have the same baseline.
-                        let larger_font_size = args.font_size / SMALLER_TEXT_RATIO;
-                        default_compute_baseline_position(
-                            larger_font_size,
-                            DEFAULT_UI_LINE_HEIGHT_RATIO,
-                            args.ascent * (larger_font_size / args.font_size),
-                            args.descent * (larger_font_size / args.font_size),
-                        )
-                    }))
-                    .finish(),
-                )
-                .finish(),
-            );
-        }
+        // No directory suffix here — rows sit under their directory's group header,
+        // which already names the path.
 
         file_row.add_child(
             Shrinkable::new(1., Clipped::new(file_and_directory.finish()).finish()).finish(),
@@ -5307,6 +5633,51 @@ impl CodeReviewView {
         )
     }
 
+    /// Position ID for the directory group header prepended to the first file of a
+    /// directory run in the main list (used to measure its height for sticky offsets).
+    fn dir_group_header_position(&self, file_index: usize) -> String {
+        format!(
+            "CodeReviewView-{}-DirGroupHeader-{file_index}",
+            self.position_id_prefix
+        )
+    }
+
+    /// Whether this list item renders the last VISIBLE content of its staging
+    /// section — i.e. it draws the section's bottom border. Files hidden inside a
+    /// collapsed directory are invisible, but each directory run's first file
+    /// still shows the directory header, which counts as visible content.
+    fn is_last_visible_in_section(&self, file_index: usize) -> bool {
+        let Some(repo) = self.active_repo.as_ref() else {
+            return true;
+        };
+        let CodeReviewViewState::Loaded(loaded) = &repo.state else {
+            return true;
+        };
+        let Some((_, this_file)) = loaded.file_states.get_index(file_index) else {
+            return true;
+        };
+        let section = this_file.file_diff.staging_section;
+        let mut prev_dir_key = Self::sidebar_dir_key(&this_file.file_diff);
+        for fs in loaded
+            .file_states
+            .values()
+            .skip(file_index + 1)
+            .take_while(|fs| fs.file_diff.staging_section == section)
+        {
+            let dir_key = Self::sidebar_dir_key(&fs.file_diff);
+            let starts_run = dir_key != prev_dir_key;
+            let collapsed = repo.collapsed_sidebar_dirs.contains(&dir_key);
+            // A run's first file shows its directory header; a file in an
+            // expanded directory shows its card. Either way, visible content
+            // follows, so this item isn't the section's last.
+            if starts_run || !collapsed {
+                return false;
+            }
+            prev_dir_key = dir_key;
+        }
+        true
+    }
+
     fn staging_section_header_position(&self, file_index: usize) -> String {
         format!(
             "CodeReviewView-{}-StagingHeader-{file_index}",
@@ -5379,12 +5750,95 @@ impl CodeReviewView {
             };
         }
 
+        // Directory grouping: the first file of each directory run (files are
+        // sorted so runs are contiguous — see `file_group_order`) prepends a
+        // collapsible "<dir>/" header. Collapse state is shared with the sidebar.
+        let dir_key = Self::sidebar_dir_key(&file.file_diff);
+        let starts_dir_group = file_index == 0
+            || match self.state() {
+                CodeReviewViewState::Loaded(loaded) => loaded
+                    .file_states
+                    .get_index(file_index - 1)
+                    .map(|(_, prev)| Self::sidebar_dir_key(&prev.file_diff) != dir_key)
+                    .unwrap_or(true),
+                _ => true,
+            };
+        let dir_collapsed = self
+            .active_repo
+            .as_ref()
+            .is_some_and(|repo| repo.collapsed_sidebar_dirs.contains(&dir_key));
+        let dir_header = if starts_dir_group {
+            match self.state() {
+                CodeReviewViewState::Loaded(loaded) => {
+                    let count = loaded
+                        .file_states
+                        .values()
+                        .filter(|fs| Self::sidebar_dir_key(&fs.file_diff) == dir_key)
+                        .count();
+                    let mouse_state = loaded
+                        .sidebar_dir_mouse_states
+                        .get(&dir_key)
+                        .cloned()
+                        .unwrap_or_default();
+                    Some(self.render_dir_group_header(
+                        Self::sidebar_dir_of(&file.file_diff.file_path),
+                        count,
+                        dir_collapsed,
+                        dir_key.clone(),
+                        mouse_state,
+                        appearance,
+                    ))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let staging_on = self.staging_area_enabled(app);
+        let is_section_first = section_header.is_some();
+
+        // A collapsed directory shows only its boxed header strip (on the run's
+        // first file); every other file in the run renders to zero height.
+        if dir_collapsed {
+            let Some(dir_header) = dir_header else {
+                return Empty::new().finish();
+            };
+            let group_box = self.wrap_dir_group_item(dir_header, true, true, appearance);
+            let inner = match section_header {
+                Some(header) => {
+                    let mut column =
+                        Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+                    column.add_child(
+                        SavePosition::new(
+                            header,
+                            &self.staging_section_header_position(file_index),
+                        )
+                        .finish(),
+                    );
+                    column.add_child(group_box);
+                    column.finish()
+                }
+                None => group_box,
+            };
+            return if staging_on {
+                self.wrap_section_item(
+                    inner,
+                    is_section_first,
+                    self.is_last_visible_in_section(file_index),
+                    appearance,
+                )
+            } else {
+                inner
+            };
+        }
+
         let is_item_being_scrolled = file_index == scroll_offset_from_top.list_item_index();
         // Height of the prepended staging section header (0 when this file has none). The
         // header lives inside this list item, above the file block, so the sticky-header
         // offset must subtract it — otherwise the sticky title floats one header-height too
         // low (the symptom seen only on the first file of each section).
-        let section_header_height = if section_header.is_some() {
+        let mut section_header_height = if section_header.is_some() {
             app.element_position_by_id_at_last_frame(
                 self.window_id,
                 self.staging_section_header_position(file_index),
@@ -5394,6 +5848,16 @@ impl CodeReviewView {
         } else {
             0.
         };
+        // The directory group header also lives inside this list item.
+        if dir_header.is_some() {
+            section_header_height += app
+                .element_position_by_id_at_last_frame(
+                    self.window_id,
+                    self.dir_group_header_position(file_index),
+                )
+                .map(|rect| rect.height())
+                .unwrap_or(DIR_GROUP_HEADER_HEIGHT);
+        }
         // Distance scrolled into the file body itself, past any section header. The sticky
         // header engages only once the body starts sliding under the fixed area; this also
         // suppresses it at the very top, replacing the old `is_first_item_with_no_scroll`.
@@ -5463,31 +5927,46 @@ impl CodeReviewView {
             content.add_child(stack.finish());
         }
 
-        let staging_on = self.staging_area_enabled(app);
-        let is_section_first = section_header.is_some();
-        let is_section_last = staging_on
-            && match file.file_diff.staging_section {
-                StagingSection::Staged => file_index + 1 == self.staged_file_count(),
-                StagingSection::Unstaged => file_index + 1 == self.loaded_file_count(),
-            };
+        let is_section_last = staging_on && self.is_last_visible_in_section(file_index);
+        let is_group_last = self.is_last_in_dir_group(file_index);
 
         let file_block = Container::new(Shrinkable::new(1., content.finish()).finish())
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
-            // In staging mode the inter-card spacing lives inside the section border (so the
-            // border stays continuous); otherwise keep the original gap between cards.
-            .with_margin_bottom(if staging_on { 0. } else { EDITOR_GAP })
             .finish();
 
+        // The card sits inside its directory's sub-group box with an even inset;
+        // the run's last card also pads the box bottom.
+        let card = Container::new(file_block)
+            .with_margin_left(8.)
+            .with_margin_right(8.)
+            .with_margin_top(8.)
+            .with_margin_bottom(if is_group_last { 8. } else { 0. })
+            .finish();
+
+        let group_slice = {
+            let mut column = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+            if let Some(dir_header) = dir_header {
+                column.add_child(
+                    SavePosition::new(dir_header, &self.dir_group_header_position(file_index))
+                        .finish(),
+                );
+            }
+            column.add_child(card);
+            self.wrap_dir_group_item(column.finish(), starts_dir_group, is_group_last, appearance)
+        };
+
         let inner = match section_header {
-            Some(header) => Flex::column()
-                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-                .with_child(
+            Some(header) => {
+                let mut column =
+                    Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+                column.add_child(
                     SavePosition::new(header, &self.staging_section_header_position(file_index))
                         .finish(),
-                )
-                .with_child(file_block)
-                .finish(),
-            None => file_block,
+                );
+                column.add_child(group_slice);
+                column.finish()
+            }
+            None => group_slice,
         };
 
         if staging_on {
@@ -5524,12 +6003,163 @@ impl CodeReviewView {
                     .with_border_fill(theme.outline()),
             )
             .with_corner_radius(corner)
-            .with_horizontal_padding(6.)
-            // Spacing between file cards lives inside the border; the last card gets a small
-            // bottom inset, and only the last item carries the gap to the next section.
-            .with_padding_bottom(if is_last { 6. } else { EDITOR_GAP })
+            .with_horizontal_padding(10.)
+            // Items inside the section are directory sub-group slices that must
+            // stack flush (their own borders are drawn per slice); inter-group
+            // spacing lives on the group slices themselves. Only the section's
+            // last item adds a small inner inset plus the gap to the next section.
+            .with_padding_bottom(if is_last { 2. } else { 0. })
             .with_margin_bottom(if is_last { EDITOR_GAP } else { 0. })
             .finish()
+    }
+
+    /// Wraps one list item's slice of a directory sub-group box. Mirrors
+    /// [`Self::wrap_section_item`]: every slice draws left/right borders, the
+    /// first adds the rounded top (behind the group header strip), the last adds
+    /// the rounded bottom and the gap to the next group.
+    fn wrap_dir_group_item(
+        &self,
+        inner: Box<dyn Element>,
+        is_first: bool,
+        is_last: bool,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let radius = Radius::Pixels(8.);
+        let corner = match (is_first, is_last) {
+            (true, true) => CornerRadius::with_all(radius),
+            (true, false) => CornerRadius::with_top(radius),
+            (false, true) => CornerRadius::with_bottom(radius),
+            (false, false) => CornerRadius::with_all(Radius::Pixels(0.)),
+        };
+        Container::new(inner)
+            .with_border(
+                Border::all(1.)
+                    .with_sides(is_first, true, is_last, true)
+                    .with_border_fill(theme.surface_3()),
+            )
+            .with_corner_radius(corner)
+            .with_margin_bottom(if is_last { 8. } else { 0. })
+            .finish()
+    }
+
+    /// Whether this file is the last one of its directory run (the section is
+    /// part of the group key, so section boundaries also end a run).
+    fn is_last_in_dir_group(&self, file_index: usize) -> bool {
+        let CodeReviewViewState::Loaded(loaded) = self.state() else {
+            return true;
+        };
+        let Some((_, this_file)) = loaded.file_states.get_index(file_index) else {
+            return true;
+        };
+        let this_key = Self::sidebar_dir_key(&this_file.file_diff);
+        loaded
+            .file_states
+            .get_index(file_index + 1)
+            .map(|(_, next)| Self::sidebar_dir_key(&next.file_diff) != this_key)
+            .unwrap_or(true)
+    }
+
+    /// Full-width header strip of a directory sub-group in the main list:
+    /// distinct background, chevron + path + count pill. When the group is
+    /// collapsed the strip is the entire box, so it rounds all four corners.
+    fn render_dir_group_header(
+        &self,
+        dir: &str,
+        count: usize,
+        collapsed: bool,
+        key: String,
+        mouse_state: MouseStateHandle,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let chevron = if collapsed {
+            Icon::ChevronRight
+        } else {
+            Icon::ChevronDown
+        };
+        let muted = theme.sub_text_color(theme.surface_2());
+        let label = if dir.is_empty() {
+            "(root)".to_string()
+        } else {
+            format!("{dir}/")
+        };
+
+        let mut row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+        row.add_child(
+            Container::new(
+                ConstrainedBox::new(
+                    chevron
+                        .to_warpui_icon(warp_core::ui::theme::Fill::Solid(muted.into()))
+                        .finish(),
+                )
+                .with_width(12.)
+                .with_height(12.)
+                .finish(),
+            )
+            .with_margin_right(8.)
+            .finish(),
+        );
+        row.add_child(
+            Shrinkable::new(
+                1.,
+                Text::new(
+                    label,
+                    appearance.ui_font_family(),
+                    appearance.ui_font_size() - 1.,
+                )
+                .with_color(theme.main_text_color(theme.surface_2()).into())
+                .with_clip(ClipConfig::end())
+                .soft_wrap(false)
+                .finish(),
+            )
+            .finish(),
+        );
+        row.add_child(
+            Container::new(
+                Text::new(
+                    count.to_string(),
+                    appearance.ui_font_family(),
+                    appearance.ui_font_size() - 2.,
+                )
+                .with_color(muted.into())
+                .soft_wrap(false)
+                .finish(),
+            )
+            .with_horizontal_padding(6.)
+            .with_vertical_padding(1.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(9.)))
+            .with_background(warp_core::ui::theme::Fill::Solid(internal_colors::neutral_3(
+                theme,
+            )))
+            .with_margin_left(8.)
+            .finish(),
+        );
+
+        // Inside the group's 1px border, so the strip's radius is one less.
+        let corner = if collapsed {
+            CornerRadius::with_all(Radius::Pixels(7.))
+        } else {
+            CornerRadius::with_top(Radius::Pixels(7.))
+        };
+        Hoverable::new(mouse_state, move |mouse_state| {
+            let background = if mouse_state.is_hovered() {
+                internal_colors::neutral_3(appearance.theme())
+            } else {
+                internal_colors::neutral_2(appearance.theme())
+            };
+            Container::new(row.finish())
+                .with_background(warp_core::ui::theme::Fill::Solid(background))
+                .with_vertical_padding(8.)
+                .with_horizontal_padding(12.)
+                .with_corner_radius(corner)
+                .finish()
+        })
+        .on_click(move |ctx, _, _| {
+            ctx.dispatch_typed_action(CodeReviewAction::ToggleSidebarDirCollapsed(key.clone()));
+        })
+        .with_cursor(Cursor::PointingHand)
+        .finish()
     }
 
     /// Renders the file header with name and status.
@@ -5547,7 +6177,13 @@ impl CodeReviewView {
     ) -> Box<dyn Element> {
         let theme = appearance.theme();
 
-        let file_name = file.file_diff.file_path.clone();
+        // Just the file name — the directory lives on the group header above the
+        // card (renames keep full paths for old → new context).
+        let file_name = Path::new(&file.file_diff.file_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| file.file_diff.file_path.clone());
 
         let mut left_section = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
@@ -5669,6 +6305,28 @@ impl CodeReviewView {
             right_row.add_child(
                 EventHandler::new(
                     Container::new(ChildView::new(&file.stage_unstage_button).finish())
+                        .with_margin_left(4.)
+                        .finish(),
+                )
+                .on_left_mouse_up(|_, _, _| DispatchEventResult::StopPropagation)
+                .on_left_mouse_down(|_, _, _| DispatchEventResult::StopPropagation)
+                .finish(),
+            );
+        }
+
+        // Only offer "Expand full file" while some of the file is actually hidden.
+        let has_hidden_sections = file.editor_state.as_ref().is_some_and(|editor_state| {
+            editor_state
+                .editor()
+                .as_ref(app)
+                .editor()
+                .as_ref(app)
+                .has_hidden_sections(app)
+        });
+        if has_hidden_sections {
+            right_row.add_child(
+                EventHandler::new(
+                    Container::new(ChildView::new(&file.expand_file_button).finish())
                         .with_margin_left(4.)
                         .finish(),
                 )
@@ -6144,6 +6802,53 @@ impl CodeReviewView {
         }
     }
 
+    /// Counts (untracked, total) among the discard dialog's currently-selected
+    /// files. Untracked files can't be restored — discarding them deletes them —
+    /// so the dialog copy and confirm label switch to delete wording.
+    fn discard_selection_untracked_counts(&self) -> (usize, usize) {
+        let CodeReviewViewState::Loaded(loaded) = self.state() else {
+            return (0, 0);
+        };
+        let mut untracked = 0;
+        let mut total = 0;
+        for path in &self.discard_dialog_state.discard_file_paths {
+            // Single-file dialogs have no checkbox map; everything listed is selected.
+            let selected = self
+                .discard_dialog_state
+                .selected_files
+                .get(path)
+                .copied()
+                .unwrap_or(true);
+            if !selected {
+                continue;
+            }
+            total += 1;
+            let is_untracked = loaded
+                .file_states
+                .values()
+                .find(|fs| fs.file_diff.file_path == *path)
+                .is_some_and(|fs| matches!(fs.file_diff.status, GitFileStatus::Untracked));
+            if is_untracked {
+                untracked += 1;
+            }
+        }
+        (untracked, total)
+    }
+
+    /// Keeps the confirm button's label in sync with the selection: "Delete" when
+    /// every selected file is untracked, "Discard changes" otherwise.
+    fn refresh_discard_confirm_label(&self, ctx: &mut ViewContext<Self>) {
+        let (untracked, total) = self.discard_selection_untracked_counts();
+        let label = if total > 0 && untracked == total {
+            "Delete"
+        } else {
+            "Discard changes"
+        };
+        self.discard_dialog_state
+            .discard_confirm_button
+            .update(ctx, |button, ctx| button.set_label(label, ctx));
+    }
+
     fn render_discard_confirm_dialog(&self, app: &AppContext) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
 
@@ -6171,10 +6876,31 @@ impl CodeReviewView {
             .with_max_height(200.0)
             .finish();
 
-        let (title, description) = (
-            self.discard_dialog_state.operation_type.title(),
-            self.discard_dialog_state.operation_type.description(),
-        );
+        // Untracked files aren't restored, they're deleted — say so instead of the
+        // misleading "restore to the last committed version" copy.
+        let (untracked, total) = self.discard_selection_untracked_counts();
+        let (title, description) = if total > 0 && untracked == total {
+            (
+                if total == 1 {
+                    "Delete untracked file?".to_string()
+                } else {
+                    format!("Delete {total} untracked files?")
+                },
+                Some(
+                    "Untracked files aren't in git history, so they can't be restored — they will be deleted."
+                        .to_string(),
+                ),
+            )
+        } else {
+            let description = self.discard_dialog_state.operation_type.description().map(|desc| {
+                if untracked > 0 {
+                    format!("{desc} Untracked files in the selection will be deleted.")
+                } else {
+                    desc
+                }
+            });
+            (self.discard_dialog_state.operation_type.title(), description)
+        };
 
         let mut dialog_builder = Dialog::new(
             title,
@@ -6346,6 +7072,79 @@ impl CodeReviewView {
         self.discard_dialog_state.stash_changes_enabled = false;
     }
 
+    /// Adds the staging-area hunk buttons to a file card's editor: Changes cards
+    /// stage hunks (and keep the worktree revert button), Staged cards unstage
+    /// them. Revert is a worktree edit, so it only fits worktree-vs-index diffs.
+    fn add_hunk_staging_buttons(
+        &self,
+        editor_view: CodeEditorView,
+        file_diff: &FileDiff,
+        app: &AppContext,
+    ) -> CodeEditorView {
+        let staging_ops_available =
+            self.staging_area_enabled(app) && self.repo_is_local().unwrap_or(false);
+        match file_diff.staging_section {
+            StagingSection::Unstaged => {
+                let editor_view = editor_view.with_revert_diff_hunk_button();
+                if staging_ops_available && !matches!(file_diff.status, GitFileStatus::Untracked) {
+                    editor_view.with_stage_hunk_button(StageHunkKind::Stage)
+                } else {
+                    editor_view
+                }
+            }
+            StagingSection::Staged if staging_ops_available => {
+                editor_view.with_stage_hunk_button(StageHunkKind::Unstage)
+            }
+            StagingSection::Staged => editor_view,
+        }
+    }
+
+    /// Applies a hunk-level stage/unstage request from a file card's editor. The
+    /// hunk is resolved from the file's diff by line range: staged-card requests
+    /// (`stage == false`) look up the staged entry, unstaged ones the bare entry.
+    fn handle_hunk_stage_request(
+        &mut self,
+        file_path: &str,
+        line_range: Range<LineCount>,
+        stage: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let CodeReviewViewState::Loaded(loaded) = self.state() else {
+            return;
+        };
+        let key = if stage {
+            file_path.to_string()
+        } else {
+            Self::staged_state_key(file_path)
+        };
+        let Some(file_state) = loaded.file_states.get(&key) else {
+            return;
+        };
+        // Editor lines are 0-based; hunk coordinates are 1-based. Pure-deletion
+        // hunks collapse to an empty editor range, so allow off-by-one there.
+        let target_start = line_range.start.as_usize() + 1;
+        let Some(hunk) = file_state
+            .file_diff
+            .hunks
+            .iter()
+            .find(|hunk| {
+                let start = hunk.new_start_line;
+                let end = hunk.new_start_line + hunk.new_line_count.max(1);
+                (start..end).contains(&target_start)
+                    || (hunk.new_line_count == 0
+                        && (target_start == start || target_start == start + 1))
+            })
+            .cloned()
+        else {
+            log::warn!("No diff hunk found for stage request at line {target_start}");
+            return;
+        };
+        let path = file_path.to_string();
+        self.diff_state_model.update(ctx, |model, ctx| {
+            model.stage_hunk(path, hunk, stage, ctx);
+        });
+    }
+
     fn handle_code_editor_event(
         &mut self,
         file_path: String,
@@ -6390,6 +7189,9 @@ impl CodeReviewView {
                         .invalidate_height_for_index(index);
                     ctx.notify();
                 }
+            }
+            CodeEditorEvent::DiffHunkStageRequested { line_range, stage } => {
+                self.handle_hunk_stage_request(&file_path, line_range.clone(), *stage, ctx);
             }
             CodeEditorEvent::Focused => {
                 ctx.emit(CodeReviewViewEvent::Pane(PaneEvent::FocusSelf));
@@ -7946,8 +8748,7 @@ impl TypedActionView for CodeReviewView {
                             let file = &mut state.file_states[index];
                             file.is_expanded = !file.is_expanded;
                             let now_expanded = file.is_expanded;
-                            repo.file_expanded
-                                .insert(file.file_diff.file_path.clone(), now_expanded);
+                            repo.file_expanded.insert(path.clone(), now_expanded);
                             (index, now_expanded, file.chevron_button.clone())
                         } else {
                             return;
@@ -7982,6 +8783,47 @@ impl TypedActionView for CodeReviewView {
                     });
                 }
 
+                ctx.notify();
+            }
+            CodeReviewAction::ExpandEntireFile(path) => {
+                // Make sure the card itself is open, then reveal every hidden
+                // (unchanged) section so the whole file is visible.
+                let (file_index, editor, chevron_button, was_collapsed) = {
+                    let Some(repo) = self.active_repo.as_mut() else {
+                        return;
+                    };
+                    let CodeReviewViewState::Loaded(state) = &mut repo.state else {
+                        return;
+                    };
+                    let Some(index) = state.file_states.get_index_of(path) else {
+                        return;
+                    };
+                    let file = &mut state.file_states[index];
+                    let was_collapsed = !file.is_expanded;
+                    if was_collapsed {
+                        file.is_expanded = true;
+                        repo.file_expanded.insert(path.clone(), true);
+                    }
+                    let editor = file
+                        .editor_state
+                        .as_ref()
+                        .map(|editor_state| editor_state.editor().clone());
+                    (index, editor, file.chevron_button.clone(), was_collapsed)
+                };
+
+                if was_collapsed {
+                    chevron_button.update(ctx, |button, ctx| {
+                        button.set_icon(Some(Icon::ChevronDown), ctx);
+                    });
+                }
+                if let Some(local_editor) = editor {
+                    let code_editor = local_editor.as_ref(ctx).editor().clone();
+                    code_editor.update(ctx, |editor, ctx| {
+                        editor.expand_entire_file(ctx);
+                    });
+                }
+                self.viewported_list_state
+                    .invalidate_height_for_index(file_index);
                 ctx.notify();
             }
             CodeReviewAction::ExpandAllFiles | CodeReviewAction::CollapseAllFiles => {
@@ -8194,10 +9036,18 @@ impl TypedActionView for CodeReviewView {
                         }
                     };
 
-                    // Collect all file paths from loaded state
+                    // Collect all file paths from loaded state. Keys carry the
+                    // staged-section sentinel and a partially-staged file appears
+                    // under both keys — map to bare paths and dedupe so the dialog
+                    // lists (and discards) each file exactly once.
                     if let CodeReviewViewState::Loaded(loaded) = self.state() {
-                        self.discard_dialog_state.discard_file_paths =
-                            loaded.file_states.keys().cloned().collect();
+                        let mut seen = HashSet::new();
+                        self.discard_dialog_state.discard_file_paths = loaded
+                            .file_states
+                            .keys()
+                            .map(|key| Self::bare_path_from_state_key(key).to_string())
+                            .filter(|path| seen.insert(path.clone()))
+                            .collect();
 
                         // Initialize all files as selected  by default
                         self.discard_dialog_state.selected_files.clear();
@@ -8212,6 +9062,7 @@ impl TypedActionView for CodeReviewView {
                         }
                     }
                 }
+                self.refresh_discard_confirm_label(ctx);
                 ctx.notify();
             }
             CodeReviewAction::ConfirmDiscardFile => {
@@ -8279,6 +9130,7 @@ impl TypedActionView for CodeReviewView {
                 if let Some(selected) = self.discard_dialog_state.selected_files.get_mut(file_path)
                 {
                     *selected = !*selected;
+                    self.refresh_discard_confirm_label(ctx);
                     ctx.notify();
                 }
             }
@@ -8382,6 +9234,13 @@ impl TypedActionView for CodeReviewView {
             }
             CodeReviewAction::StageFile(path) => {
                 if let Some(std_path) = self.to_standardized_path(path) {
+                    // A staged file's diff is dealt with — collapse its card in the
+                    // Staged section. Written to the reload-surviving expansion map
+                    // because staging rebuilds every FileState.
+                    if let Some(repo) = self.active_repo.as_mut() {
+                        repo.file_expanded
+                            .insert(Self::staged_state_key(path), false);
+                    }
                     let info = self.create_file_status_info(std_path);
                     self.diff_state_model.update(ctx, |model, ctx| {
                         model.stage_files(vec![info], ctx);
@@ -8399,6 +9258,23 @@ impl TypedActionView for CodeReviewView {
             CodeReviewAction::StageAll => {
                 let infos = self.collect_section_file_infos(StagingSection::Unstaged);
                 if !infos.is_empty() {
+                    // Same collapse-on-stage as StageFile, for every file moving over.
+                    let staged_keys: Vec<String> = match self.state() {
+                        CodeReviewViewState::Loaded(loaded) => loaded
+                            .file_states
+                            .values()
+                            .filter(|fs| {
+                                fs.file_diff.staging_section == StagingSection::Unstaged
+                            })
+                            .map(|fs| Self::staged_state_key(&fs.file_diff.file_path))
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    if let Some(repo) = self.active_repo.as_mut() {
+                        for key in staged_keys {
+                            repo.file_expanded.insert(key, false);
+                        }
+                    }
                     self.diff_state_model.update(ctx, |model, ctx| {
                         model.stage_files(infos, ctx);
                     });
@@ -8422,6 +9298,17 @@ impl TypedActionView for CodeReviewView {
                 self.unstaged_section_collapsed = !self.unstaged_section_collapsed;
                 self.invalidate_all_file_heights();
                 ctx.notify();
+            }
+            CodeReviewAction::ToggleSidebarDirCollapsed(key) => {
+                if let Some(repo) = self.active_repo.as_mut() {
+                    if !repo.collapsed_sidebar_dirs.remove(key) {
+                        repo.collapsed_sidebar_dirs.insert(key.clone());
+                    }
+                    // Main-list cards in the toggled directory change to/from zero
+                    // height; force the virtualized list to re-measure.
+                    self.invalidate_all_file_heights();
+                    ctx.notify();
+                }
             }
             CodeReviewAction::SubmitReviewComments => {
                 if self.comment_list_view.as_ref(ctx).can_send(ctx) {

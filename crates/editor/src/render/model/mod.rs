@@ -362,6 +362,32 @@ impl<'a> RenderContentTreeRef<'a> {
         }
     }
 
+    /// The full line ranges of every collapsed hidden section, in document
+    /// order. Ranges are resolved the same way as
+    /// [`Self::first_hidden_section_line_range`].
+    pub fn hidden_section_line_ranges(&self) -> Vec<Range<LineCount>> {
+        let mut ranges = Vec::new();
+        let mut cursor = self.0.cursor::<CharOffset, LayoutSummary>();
+        cursor.descend_to_first_item(&self.0, |_| true);
+        loop {
+            let range = {
+                let Some(positioned) = cursor.positioned_item() else {
+                    break;
+                };
+                if matches!(positioned.item, BlockItem::Hidden(_)) {
+                    Some(positioned.start_line..positioned.start_line + positioned.item.lines())
+                } else {
+                    None
+                }
+            };
+            if let Some(range) = range {
+                ranges.push(range);
+            }
+            cursor.next();
+        }
+        ranges
+    }
+
     pub fn is_entire_range_of_type(
         &self,
         range: &Range<CharOffset>,

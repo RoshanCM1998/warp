@@ -112,6 +112,53 @@ impl GutterButton for RevertHunkButton {
     }
 }
 
+/// Whether the hovered hunk gets a "stage" or an "unstage" affordance —
+/// Changes-section editors stage into the index, Staged-section editors
+/// take the hunk back out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageHunkKind {
+    Stage,
+    Unstage,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct StageHunkButton {
+    kind: StageHunkKind,
+    is_enabled: bool,
+}
+
+impl StageHunkButton {
+    pub fn new(kind: StageHunkKind, is_enabled: bool) -> Self {
+        Self { kind, is_enabled }
+    }
+
+    pub fn kind(&self) -> StageHunkKind {
+        self.kind
+    }
+}
+
+impl GutterButton for StageHunkButton {
+    fn is_enabled(&self) -> bool {
+        self.is_enabled
+    }
+
+    fn tooltip_text(&self) -> Option<&'static str> {
+        match (self.kind, self.is_enabled) {
+            (StageHunkKind::Stage, true) => Some("Stage hunk"),
+            (StageHunkKind::Stage, false) => Some("Save changes to stage"),
+            (StageHunkKind::Unstage, true) => Some("Unstage hunk"),
+            (StageHunkKind::Unstage, false) => Some("Save changes to unstage"),
+        }
+    }
+
+    fn icon(&self) -> Icon {
+        match self.kind {
+            StageHunkKind::Stage => Icon::Plus,
+            StageHunkKind::Unstage => Icon::Minus,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 #[allow(dead_code)]
 pub enum CommentButton {

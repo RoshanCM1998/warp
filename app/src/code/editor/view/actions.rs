@@ -650,6 +650,12 @@ pub enum CodeEditorViewAction {
     RevertDiffHunk {
         line_range: Range<LineCount>,
     },
+    /// Stage or unstage a diff hunk in the git index (when clicking the
+    /// stage/unstage gutter icon in the code review staging area)
+    StageOrUnstageDiffHunk {
+        line_range: Range<LineCount>,
+        stage: bool,
+    },
     /// Open comment line (when opening a comment on a specific line)
     NewCommentOnLine {
         line: EditorLineLocation,
@@ -799,6 +805,7 @@ impl CodeEditorViewAction {
             | Self::HiddenSectionExpansion { .. }
             | Self::AddDiffHunkContext { .. }
             | Self::RevertDiffHunk { .. }
+            | Self::StageOrUnstageDiffHunk { .. }
             | Self::NewCommentOnLine { .. }
             | Self::RequestOpenSavedComment { .. }
             | Self::MouseHovered { .. }
@@ -1083,6 +1090,15 @@ impl TypedActionView for CodeEditorView {
                     // Notify to re-render
                     ctx.notify();
                 }
+            }
+            StageOrUnstageDiffHunk { line_range, stage } => {
+                // The hunk itself lives in code-review state; the parent resolves
+                // it from the line range and applies it to the index.
+                ctx.emit(CodeEditorEvent::DiffHunkStageRequested {
+                    line_range: line_range.clone(),
+                    stage: *stage,
+                });
+                ctx.notify();
             }
             NewCommentOnLine { line: line_info } => {
                 if FeatureFlag::InlineCodeReview.is_enabled() {
