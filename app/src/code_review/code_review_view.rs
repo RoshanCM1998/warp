@@ -261,8 +261,9 @@ const EDITOR_GAP: f32 = 12.;
 /// fallback for the sticky-header offset before the header has been measured. If the
 /// header styling changes substantially, update this value.
 const STAGING_SECTION_HEADER_HEIGHT: f32 = 36.;
-/// Same role as [`STAGING_SECTION_HEADER_HEIGHT`], for the directory group header.
-const DIR_GROUP_HEADER_HEIGHT: f32 = 26.;
+/// Same role as [`STAGING_SECTION_HEADER_HEIGHT`], for the directory group header
+/// (8px vertical padding on both sides around a ~17px text row).
+const DIR_GROUP_HEADER_HEIGHT: f32 = 33.;
 const FILE_SIDEBAR_PANE_WIDTH_PERCENTAGE: f32 = 0.25;
 /// Vertical gap between the right panel header row and the code review content below it
 /// (sub-header in loaded state, loading text in loading state).
@@ -5857,6 +5858,17 @@ impl CodeReviewView {
                 )
                 .map(|rect| rect.height())
                 .unwrap_or(DIR_GROUP_HEADER_HEIGHT);
+        }
+        // The card also sits inset inside its directory sub-group box: an 8px top
+        // margin, plus the 1px group (and section) top borders on the run's /
+        // section's first item. Without these the sticky header engages late and
+        // the file name scrolls under the group border before pinning.
+        section_header_height += 8.;
+        if starts_dir_group {
+            section_header_height += 1.;
+        }
+        if section_header.is_some() {
+            section_header_height += 1.;
         }
         // Distance scrolled into the file body itself, past any section header. The sticky
         // header engages only once the body starts sliding under the fixed area; this also
